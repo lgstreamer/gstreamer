@@ -623,6 +623,7 @@ EXPORTS
 	gst_event_new_stream_collection
 	gst_event_new_stream_group_done
 	gst_event_new_stream_start
+	gst_event_new_streams_selected
 	gst_event_new_tag
 	gst_event_new_toc
 	gst_event_new_toc_select
@@ -645,6 +646,7 @@ EXPORTS
 	gst_event_parse_stream_flags
 	gst_event_parse_stream_group_done
 	gst_event_parse_stream_start
+	gst_event_parse_streams_selected
 	gst_event_parse_tag
 	gst_event_parse_toc
 	gst_event_parse_toc_select
@@ -653,6 +655,9 @@ EXPORTS
 	gst_event_set_seqnum
 	gst_event_set_stream
 	gst_event_set_stream_flags
+	gst_event_streams_selected_add
+	gst_event_streams_selected_get_size
+	gst_event_streams_selected_get_stream
 	gst_event_type_flags_get_type
 	gst_event_type_get_flags
 	gst_event_type_get_name
@@ -1274,21 +1279,30 @@ EXPORTS
 	gst_static_pad_template_get
 	gst_static_pad_template_get_caps
 	gst_static_pad_template_get_type
+	gst_stream_add_component
 	gst_stream_collection_add_stream
+	gst_stream_collection_add_variant
 	gst_stream_collection_get_size
 	gst_stream_collection_get_stream
 	gst_stream_collection_get_type
 	gst_stream_collection_get_upstream_id
+	gst_stream_collection_get_variant_of
+	gst_stream_collection_get_variants
+	gst_stream_collection_is_variant_for
 	gst_stream_collection_new
 	gst_stream_error_get_type
 	gst_stream_error_quark
 	gst_stream_flags_get_type
 	gst_stream_get_caps
+	gst_stream_get_component_idx
+	gst_stream_get_components_size
 	gst_stream_get_stream_flags
 	gst_stream_get_stream_id
 	gst_stream_get_stream_type
 	gst_stream_get_tags
 	gst_stream_get_type
+	gst_stream_has_component
+	gst_stream_has_component_by_name
 	gst_stream_new
 	gst_stream_set_caps
 	gst_stream_set_stream_flags

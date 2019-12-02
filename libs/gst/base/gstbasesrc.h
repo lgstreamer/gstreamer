@@ -110,6 +110,9 @@ struct _GstBaseSrc {
 
   GstBaseSrcPrivate *priv;
 
+  GstStructure  *smart_prop;
+  gboolean      rew_eos;
+
   /*< private >*/
   gpointer       _gst_reserved[GST_PADDING_LARGE];
 };
@@ -299,6 +302,9 @@ gboolean        gst_base_src_get_do_timestamp (GstBaseSrc *src);
 
 GST_BASE_API
 gboolean        gst_base_src_new_seamless_segment (GstBaseSrc *src, gint64 start, gint64 stop, gint64 time);
+
+GST_BASE_API
+gboolean        gst_base_src_new_segment      (GstBaseSrc *src, GstSegment * segment);
 
 GST_BASE_API
 gboolean        gst_base_src_set_caps         (GstBaseSrc *src, GstCaps *caps);

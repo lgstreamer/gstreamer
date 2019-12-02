@@ -168,6 +168,7 @@ struct _GstQueue2
   gint avg_out;
   gboolean percent_changed;
   GMutex buffering_post_lock; /* assures only one posted at a time */
+  gboolean dvr_playback;
 };
 
 struct _GstQueue2Class

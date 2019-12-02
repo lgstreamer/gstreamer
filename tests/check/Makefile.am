@@ -8,11 +8,7 @@ REGISTRY_ENVIRONMENT = \
 	GST_REGISTRY=$(CHECK_REGISTRY)
 
 AM_TESTS_ENVIRONMENT += \
-        GST_STATE_IGNORE_ELEMENTS="$(STATE_IGNORE_ELEMENTS)"	\
-        $(REGISTRY_ENVIRONMENT)					\
-        GST_PLUGIN_SCANNER_1_0=$(top_builddir)/libs/gst/helpers/gst-plugin-scanner \
-        GST_PLUGIN_SYSTEM_PATH_1_0=					\
-        GST_PLUGIN_PATH_1_0=$(top_builddir)/plugins
+        GST_STATE_IGNORE_ELEMENTS="$(STATE_IGNORE_ELEMENTS)"
 
 plugindir = $(libdir)/gstreamer-@GST_API_VERSION@
 
@@ -178,6 +174,23 @@ noinst_PROGRAMS =
 
 TESTS = $(check_PROGRAMS)
 
+install-ptest: $(TESTS)
+	@$(INSTALL) -d $(DESTDIR)
+	@for dir in `find -maxdepth 1 -type d`; do \
+		if [ -x $$dir/.libs ]; then \
+			$(INSTALL) -d $(DESTDIR)/$$dir; \
+			$(INSTALL_PROGRAM) $$dir/.libs/* $(DESTDIR)/$$dir/; \
+		fi \
+	done
+
+runtests:
+	@for b in $(TESTS); do \
+		if [ -x $$b ]; then \
+			$(AM_TESTS_ENVIRONMENT) $(SHELL) test-driver --test-name "$$b" \
+			--log-file $$b.log --trs-file $$b.trs $$b; \
+		fi \
+	done
+
 noinst_HEADERS = \
 	gst/capslist.h \
 	gst/struct_arm.h \
@@ -221,9 +234,9 @@ gst_gstprintf_LDADD = \
 	$(LDADD)
 
 elements_fdsrc_CFLAGS=$(GST_OBJ_CFLAGS) $(AM_CFLAGS) \
-	-DTESTFILE=\"$(top_srcdir)/configure.ac\"
+	-DTESTFILE=\"Makefile\"
 elements_filesrc_CFLAGS=$(GST_OBJ_CFLAGS) $(AM_CFLAGS) \
-	-DTESTFILE=\"$(top_srcdir)/configure.ac\"
+	-DTESTFILE=\"Makefile\"
 
 libs_controller_LDADD = \
 	$(top_builddir)/libs/gst/controller/libgstcontroller-@GST_API_VERSION@.la \

@@ -112,6 +112,25 @@ GST_API
 gboolean gst_stream_collection_add_stream (GstStreamCollection *collection,
                                            GstStream *stream);
 
+GST_API
+gboolean gst_stream_collection_add_variant(GstStreamCollection *collection,
+					   const gchar *stream_id,
+					   GstStream *variant_stream);
+
+GST_API
+gboolean gst_stream_collection_is_variant_for(GstStreamCollection *collection,
+					      const GstStream *candidate,
+					      const gchar *stream_id);
+
+GST_API
+GList *gst_stream_collection_get_variants(GstStreamCollection *collection,
+					  const gchar *stream_id);
+
+GST_API
+const gchar *gst_stream_collection_get_variant_of(GstStreamCollection *collection,
+						  const gchar *stream_id);
+
+
 #ifdef G_DEFINE_AUTOPTR_CLEANUP_FUNC
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(GstStreamCollection, gst_object_unref)
 #endif

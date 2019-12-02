@@ -144,9 +144,6 @@ GST_DEBUG_CATEGORY_STATIC (bin_debug);
  * a toplevel bin */
 #define BIN_IS_TOPLEVEL(bin) ((GST_OBJECT_PARENT (bin) == NULL) || bin->priv->asynchandling)
 
-#define GST_BIN_GET_PRIVATE(obj)  \
-   (G_TYPE_INSTANCE_GET_PRIVATE ((obj), GST_TYPE_BIN, GstBinPrivate))
-
 struct _GstBinPrivate
 {
   gboolean asynchandling;
@@ -167,9 +164,14 @@ struct _GstBinPrivate
   /* forward messages from our children */
   gboolean message_forward;
 
+  /* forward stream-collection message */
+  gboolean collection_message_forward;
+
   gboolean posted_eos;
   gboolean posted_playing;
   GstElementFlags suppressed_flags;
+
+  GstBinStateFailureNotifyFunc notify_failure;
 };
 
 typedef struct
@@ -244,12 +246,14 @@ enum
 
 #define DEFAULT_ASYNC_HANDLING	FALSE
 #define DEFAULT_MESSAGE_FORWARD	FALSE
+#define DEFAULT_COLLECTION_MESSAGE_FORWARD TRUE
 
 enum
 {
   PROP_0,
   PROP_ASYNC_HANDLING,
   PROP_MESSAGE_FORWARD,
+  PROP_COLLECTION_MESSAGE_FORWARD,
   PROP_LAST
 };
 
@@ -272,7 +276,9 @@ static guint gst_bin_signals[LAST_SIGNAL] = { 0 };
 }
 
 #define gst_bin_parent_class parent_class
-G_DEFINE_TYPE_WITH_CODE (GstBin, gst_bin, GST_TYPE_ELEMENT, _do_init);
+G_DEFINE_TYPE_WITH_CODE (GstBin, gst_bin, GST_TYPE_ELEMENT,
+    G_ADD_PRIVATE (GstBin)
+    _do_init);
 
 static GObject *
 gst_bin_child_proxy_get_child_by_index (GstChildProxy * child_proxy,
@@ -339,8 +345,6 @@ gst_bin_class_init (GstBinClass * klass)
 
   gobject_class = (GObjectClass *) klass;
   gstelement_class = (GstElementClass *) klass;
-
-  g_type_class_add_private (klass, sizeof (GstBinPrivate));
 
   gobject_class->set_property = gst_bin_set_property;
   gobject_class->get_property = gst_bin_get_property;
@@ -448,6 +452,19 @@ gst_bin_class_init (GstBinClass * klass)
           "Forwards all children messages",
           DEFAULT_MESSAGE_FORWARD, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  /**
+   * GstBin:collection-message-forward:
+   *
+   * Forward stream-collection message.
+   */
+  g_object_class_install_property (gobject_class,
+      PROP_COLLECTION_MESSAGE_FORWARD,
+      g_param_spec_boolean ("collection-message-forward",
+          "'stream-collection' Message Forward",
+          "Forwards 'stream-collection' message",
+          DEFAULT_COLLECTION_MESSAGE_FORWARD,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   gobject_class->dispose = gst_bin_dispose;
 
   gst_element_class_set_static_metadata (gstelement_class, "Generic bin",
@@ -503,10 +520,12 @@ gst_bin_init (GstBin * bin)
   gst_bus_set_sync_handler (bus, (GstBusSyncHandler) bin_bus_handler, bin,
       NULL);
 
-  bin->priv = GST_BIN_GET_PRIVATE (bin);
+  bin->priv = gst_bin_get_instance_private (bin);
   bin->priv->asynchandling = DEFAULT_ASYNC_HANDLING;
   bin->priv->structure_cookie = 0;
   bin->priv->message_forward = DEFAULT_MESSAGE_FORWARD;
+  bin->priv->collection_message_forward = DEFAULT_COLLECTION_MESSAGE_FORWARD;
+  bin->priv->notify_failure = NULL;
 }
 
 static void
@@ -525,6 +544,9 @@ gst_bin_dispose (GObject * object)
   gst_object_replace ((GstObject **) clock_provider_p, NULL);
   bin_remove_messages (bin, NULL, GST_MESSAGE_ANY);
   GST_OBJECT_UNLOCK (object);
+
+  if (bin->priv->notify_failure)
+    bin->priv->notify_failure = NULL;
 
   while (bin->children) {
     gst_bin_remove (bin, GST_ELEMENT_CAST (bin->children->data));
@@ -570,6 +592,11 @@ gst_bin_set_property (GObject * object, guint prop_id,
       gstbin->priv->message_forward = g_value_get_boolean (value);
       GST_OBJECT_UNLOCK (gstbin);
       break;
+    case PROP_COLLECTION_MESSAGE_FORWARD:
+      GST_OBJECT_LOCK (gstbin);
+      gstbin->priv->collection_message_forward = g_value_get_boolean (value);
+      GST_OBJECT_UNLOCK (gstbin);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -593,6 +620,11 @@ gst_bin_get_property (GObject * object, guint prop_id,
     case PROP_MESSAGE_FORWARD:
       GST_OBJECT_LOCK (gstbin);
       g_value_set_boolean (value, gstbin->priv->message_forward);
+      GST_OBJECT_UNLOCK (gstbin);
+      break;
+    case PROP_COLLECTION_MESSAGE_FORWARD:
+      GST_OBJECT_LOCK (gstbin);
+      g_value_set_boolean (value, gstbin->priv->collection_message_forward);
       GST_OBJECT_UNLOCK (gstbin);
       break;
     default:
@@ -990,7 +1022,7 @@ is_eos (GstBin * bin, guint32 * seqnum)
       /* check if element posted EOS */
       if ((msgs =
               find_message (bin, GST_OBJECT_CAST (element), GST_MESSAGE_EOS))) {
-        GST_DEBUG ("sink '%s' posted EOS", GST_ELEMENT_NAME (element));
+        GST_SYS_DEBUG ("sink '%s' posted EOS", GST_ELEMENT_NAME (element));
         *seqnum = gst_message_get_seqnum (GST_MESSAGE_CAST (msgs->data));
         n_eos++;
       } else {
@@ -2821,6 +2853,20 @@ gst_bin_post_message (GstElement * element, GstMessage * msg)
   return ret;
 }
 
+gboolean
+gst_bin_set_state_failure_notify (GstBin * bin, gpointer func)
+{
+  g_return_val_if_fail (bin->priv->notify_failure == NULL, FALSE);
+
+  GST_DEBUG_OBJECT (bin, "set state failure notify function");
+
+  GST_OBJECT_LOCK (bin);
+  bin->priv->notify_failure = (GstBinStateFailureNotifyFunc) func;
+  GST_OBJECT_UNLOCK (bin);
+
+  return TRUE;
+}
+
 static void
 reset_state (const GValue * data, gpointer user_data)
 {
@@ -2968,6 +3014,11 @@ restart:
                 "child '%s' failed to go to state %d(%s)",
                 GST_ELEMENT_NAME (child),
                 next, gst_element_state_get_name (next));
+
+            /* notify state change failure */
+            if (bin->priv->notify_failure) {
+              bin->priv->notify_failure (bin, child);
+            }
 
             /* Only fail if the child is still inside
              * this bin. It might've been removed already
@@ -3476,7 +3527,7 @@ bin_handle_async_done (GstBin * bin, GstStateChangeReturn ret,
   }
   if (amessage) {
     /* post our combined ASYNC_DONE when all is ASYNC_DONE. */
-    GST_DEBUG_OBJECT (bin, "posting ASYNC_DONE to parent");
+    GST_SYS_DEBUG_OBJECT (bin, "posting ASYNC_DONE to parent");
     gst_element_post_message (GST_ELEMENT_CAST (bin), amessage);
   }
 
@@ -3545,7 +3596,7 @@ bin_do_eos (GstBin * bin)
 
     tmessage = gst_message_new_eos (GST_OBJECT_CAST (bin));
     gst_message_set_seqnum (tmessage, seqnum);
-    GST_DEBUG_OBJECT (bin,
+    GST_SYS_DEBUG_OBJECT (bin,
         "all sinks posted EOS, posting seqnum #%" G_GUINT32_FORMAT, seqnum);
     gst_element_post_message (GST_ELEMENT_CAST (bin), tmessage);
   } else {
@@ -4042,6 +4093,16 @@ gst_bin_handle_message_func (GstBin * bin, GstMessage * message)
 
       goto forward;
       break;
+    }
+    case GST_MESSAGE_STREAM_COLLECTION:
+    {
+      if (GST_OBJECT_PARENT (bin) == NULL
+          && !bin->priv->collection_message_forward) {
+        GST_FIXME_OBJECT (bin, "Do not post message %" GST_PTR_FORMAT, message);
+        gst_message_unref (message);
+        break;
+      }
+      goto forward;
     }
     default:
       goto forward;

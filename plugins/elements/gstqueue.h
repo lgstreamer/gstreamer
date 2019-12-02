@@ -102,6 +102,10 @@ struct _GstQueue {
   /* TRUE if either position needs to be recalculated */
   gboolean sink_tainted, src_tainted;
 
+  /* timestamp of enqueued buffer */
+  GstClockTime first_timestamp;
+  GstClockTime last_timestamp;
+
   /* flowreturn when srcpad is paused */
   GstFlowReturn srcresult;
   gboolean      unexpected;

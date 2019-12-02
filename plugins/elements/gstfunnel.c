@@ -68,12 +68,19 @@ struct _GstFunnelPad
   GstPad parent;
 
   gboolean got_eos;
+  GstTagList *tags;             /* last tags received on the pad */
+
+  gboolean seen_buffer;
 };
 
 struct _GstFunnelPadClass
 {
   GstPadClass parent;
 };
+
+static void gst_funnel_pad_finalize (GObject * object);
+static void gst_funnel_pad_get_property (GObject * object,
+    guint prop_id, GValue * value, GParamSpec * pspec);
 
 G_DEFINE_TYPE (GstFunnelPad, gst_funnel_pad, GST_TYPE_PAD);
 
@@ -82,18 +89,63 @@ G_DEFINE_TYPE (GstFunnelPad, gst_funnel_pad, GST_TYPE_PAD);
 enum
 {
   PROP_0,
-  PROP_FORWARD_STICKY_EVENTS
+  PROP_FORWARD_STICKY_EVENTS,
+  PROP_PAD_TAGS
 };
 
 static void
 gst_funnel_pad_class_init (GstFunnelPadClass * klass)
 {
+  GObjectClass *gobject_class;
+
+  gobject_class = (GObjectClass *) klass;
+
+  gobject_class->finalize = gst_funnel_pad_finalize;
+
+  gobject_class->get_property = gst_funnel_pad_get_property;
+
+  g_object_class_install_property (gobject_class, PROP_PAD_TAGS,
+      g_param_spec_boxed ("tags", "Tags",
+          "The currently active tags on the pad", GST_TYPE_TAG_LIST,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 }
 
 static void
 gst_funnel_pad_init (GstFunnelPad * pad)
 {
   pad->got_eos = FALSE;
+  pad->seen_buffer = FALSE;
+}
+
+static void
+gst_funnel_pad_finalize (GObject * object)
+{
+  GstFunnelPad *fpad;
+
+  fpad = GST_FUNNEL_PAD_CAST (object);
+
+  if (fpad->tags)
+    gst_tag_list_unref (fpad->tags);
+
+  G_OBJECT_CLASS (gst_funnel_pad_parent_class)->finalize (object);
+}
+
+static void
+gst_funnel_pad_get_property (GObject * object, guint prop_id,
+    GValue * value, GParamSpec * pspec)
+{
+  GstFunnelPad *fpad = GST_FUNNEL_PAD_CAST (object);
+
+  switch (prop_id) {
+    case PROP_PAD_TAGS:
+      GST_OBJECT_LOCK (object);
+      g_value_set_boxed (value, fpad->tags);
+      GST_OBJECT_UNLOCK (object);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      break;
+  }
 }
 
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE ("sink_%u",
@@ -319,10 +371,13 @@ gst_funnel_sink_chain_object (GstPad * pad, GstFunnel * funnel,
     gboolean is_list, GstMiniObject * obj)
 {
   GstFlowReturn res;
+  GstFunnelPad *fpad = GST_FUNNEL_PAD_CAST (pad);
 
   GST_DEBUG_OBJECT (pad, "received %" GST_PTR_FORMAT, obj);
 
   GST_PAD_STREAM_LOCK (funnel->srcpad);
+
+  fpad->seen_buffer = TRUE;
 
   if ((funnel->last_sinkpad == NULL) || (funnel->forward_sticky_events
           && (funnel->last_sinkpad != pad))) {
@@ -373,6 +428,8 @@ gst_funnel_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
   gboolean forward = TRUE;
   gboolean res = TRUE;
   gboolean unlock = FALSE;
+  gboolean new_tags = FALSE;
+  gboolean forward_sticky = TRUE;
 
   GST_DEBUG_OBJECT (pad, "received event %" GST_PTR_FORMAT, event);
 
@@ -409,14 +466,41 @@ gst_funnel_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
       GST_PAD_STREAM_LOCK (funnel->srcpad);
     }
 
-    if ((funnel->last_sinkpad == NULL) || (funnel->forward_sticky_events
-            && (funnel->last_sinkpad != pad))) {
+    if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP) {
+      if (!fpad->seen_buffer)
+        forward_sticky = FALSE;
+    }
+
+    if (forward_sticky && ((funnel->last_sinkpad == NULL)
+            || (funnel->forward_sticky_events
+                && (funnel->last_sinkpad != pad)))) {
       gst_object_replace ((GstObject **) & funnel->last_sinkpad,
           GST_OBJECT (pad));
       gst_pad_sticky_events_foreach (pad, forward_events, funnel->srcpad);
     }
   }
 
+  if (GST_EVENT_TYPE (event) == GST_EVENT_TAG) {
+    GstTagList *tags, *oldtags, *newtags;
+
+    gst_event_parse_tag (event, &tags);
+
+    GST_OBJECT_LOCK (fpad);
+    oldtags = fpad->tags;
+
+    newtags = gst_tag_list_merge (oldtags, tags, GST_TAG_MERGE_REPLACE);
+    fpad->tags = newtags;
+    GST_OBJECT_UNLOCK (fpad);
+
+    if (oldtags)
+      gst_tag_list_unref (oldtags);
+    GST_DEBUG_OBJECT (pad, "received tags %" GST_PTR_FORMAT, newtags);
+
+    new_tags = TRUE;
+  }
+
+  if (new_tags)
+    g_object_notify (G_OBJECT (fpad), "tags");
   if (forward)
     res = gst_pad_push_event (funnel->srcpad, event);
   else
@@ -437,6 +521,10 @@ reset_pad (const GValue * data, gpointer user_data)
 
   GST_OBJECT_LOCK (funnel);
   fpad->got_eos = FALSE;
+  if (fpad->tags) {
+    gst_tag_list_unref (fpad->tags);
+    fpad->tags = NULL;
+  }
   GST_OBJECT_UNLOCK (funnel);
 }
 

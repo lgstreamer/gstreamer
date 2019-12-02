@@ -71,6 +71,7 @@ gst_sources = [
   'gstutils.c',
   'gstvalue.c',
   'gstparse.c',
+  'gstsyslog.c',
 ]
 
 gst_headers = [
@@ -146,6 +147,7 @@ gst_headers = [
   'gstvalue.h',
   'gstregistry.h',
   'gstparse.h',
+  'gstsyslog.h',
   'math-compat.h',
 ]
 install_headers(gst_headers, subdir : 'gstreamer-1.0/gst')

@@ -25,6 +25,16 @@
 #include <gst/gst.h>
 #include <gst/check/gstcheck.h>
 
+static GstStream *
+new_stream (const gchar * stream_id, const gchar * caps_str,
+    GstStreamType stype, GstStreamFlags sflags)
+{
+  GstCaps *caps = gst_caps_from_string (caps_str);
+  GstStream *stream = gst_stream_new (stream_id, caps, stype, sflags);
+  gst_caps_unref (caps);
+  return stream;
+}
+
 GST_START_TEST (test_stream_creation)
 {
   GstStream *stream;
@@ -88,6 +98,193 @@ GST_START_TEST (test_stream_event)
   gst_caps_unref (caps);
   gst_object_unref (stream);
   gst_object_unref (stream2);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_stream_components)
+{
+  GstStream *stream;
+  GstStream *c1, *c2, *c3;
+  const gchar *stream_id;
+
+  /* Create a stream 'shvc' made of 2 components 'base' and 'layer' */
+  stream =
+      new_stream ("shvc", "video/x-shvc", GST_STREAM_TYPE_VIDEO,
+      GST_STREAM_FLAG_NONE);
+  fail_unless (stream != NULL);
+
+  /* At this point there should be no components */
+  fail_unless_equals_int (gst_stream_get_components_size (stream), 0);
+
+  /* Create and add the components */
+  c1 = new_stream ("base", "video/x-h265", GST_STREAM_TYPE_VIDEO,
+      GST_STREAM_FLAG_NONE);
+  fail_unless (c1);
+
+  c2 = new_stream ("layer", "video/x-lhvc", GST_STREAM_TYPE_VIDEO,
+      GST_STREAM_FLAG_NONE);
+  fail_unless (c2);
+
+  /* Add the components and check size */
+  gst_stream_add_component (stream, c1);
+  fail_unless_equals_int (gst_stream_get_components_size (stream), 1);
+
+  gst_stream_add_component (stream, c2);
+  fail_unless_equals_int (gst_stream_get_components_size (stream), 2);
+
+  /* Check behaviour of gst_stream_get_components_idx */
+  c3 = gst_stream_get_component_idx (stream, 0);
+  stream_id = gst_stream_get_stream_id (c3);
+  fail_if (g_strcmp0 (stream_id, "base") && g_strcmp0 (stream_id, "layer"));
+
+  c3 = gst_stream_get_component_idx (stream, 1);
+  stream_id = gst_stream_get_stream_id (c3);
+  fail_if (g_strcmp0 (stream_id, "base") && g_strcmp0 (stream_id, "layer"));
+
+  fail_if (gst_stream_get_component_idx (stream, 3));
+
+  /* Check behaviour of gst_stream_has_component_by_name */
+  fail_unless (gst_stream_has_component_by_name (stream, "base"));
+  fail_unless (gst_stream_has_component_by_name (stream, "layer"));
+  fail_if (gst_stream_has_component_by_name (stream, "nope"));
+  fail_if (gst_stream_has_component_by_name (stream, "shvc"));
+
+  /* Check behaviour of gst_stream_has_component */
+  fail_unless (gst_stream_has_component (stream, c1));
+  fail_unless (gst_stream_has_component (stream, c2));
+  c3 = gst_stream_new ("nope", NULL, GST_STREAM_TYPE_VIDEO,
+      GST_STREAM_FLAG_NONE);
+  fail_if (gst_stream_has_component (stream, c3));
+  gst_object_unref (c3);
+
+  /* Cleanup */
+  gst_object_unref (stream);
+  gst_object_unref (c1);
+  gst_object_unref (c2);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_collection_simple)
+{
+  GstStreamCollection *collection;
+  GstStream *stream1, *stream2, *stream;
+  GstCaps *caps;
+
+  /* Simple collection with two end-user streams */
+
+  collection = gst_stream_collection_new ("upstream-id");
+  fail_unless (collection != NULL);
+  fail_unless_equals_int (gst_stream_collection_get_size (collection), 0);
+  fail_unless_equals_string (gst_stream_collection_get_upstream_id (collection),
+      "upstream-id");
+
+  /* Create streams and add them to the collection */
+  caps = gst_caps_from_string ("video/x-stream1");
+  stream1 =
+      gst_stream_new ("stream1", caps, GST_STREAM_TYPE_VIDEO,
+      GST_STREAM_FLAG_NONE);
+  gst_caps_unref (caps);
+  fail_unless (gst_stream_collection_add_stream (collection, stream1));
+  fail_unless_equals_int (gst_stream_collection_get_size (collection), 1);
+
+  caps = gst_caps_from_string ("video/x-stream2");
+  stream2 =
+      gst_stream_new ("stream2", caps, GST_STREAM_TYPE_AUDIO,
+      GST_STREAM_FLAG_NONE);
+  gst_caps_unref (caps);
+  fail_unless (gst_stream_collection_add_stream (collection, stream2));
+  fail_unless_equals_int (gst_stream_collection_get_size (collection), 2);
+
+  /* Collections are ordered */
+  stream = gst_stream_collection_get_stream (collection, 0);
+  fail_unless (stream == stream1);
+
+  stream = gst_stream_collection_get_stream (collection, 1);
+  fail_unless (stream == stream2);
+
+  /* cleanup */
+  gst_object_unref (collection);
+}
+
+GST_END_TEST;
+
+GST_START_TEST (test_collection_variants)
+{
+  GstStreamCollection *collection;
+  GstStream *astream1, *astream2, *vstream, *vstream1, *vstream2;
+
+  /* Collection with:
+   * * two end-user audio streams,
+   * * one end-user video stream with 2 variants
+   */
+
+  collection = gst_stream_collection_new ("upstream-id");
+  fail_unless (collection != NULL);
+  fail_unless_equals_int (gst_stream_collection_get_size (collection), 0);
+  fail_unless_equals_string (gst_stream_collection_get_upstream_id (collection),
+      "upstream-id");
+
+  /* Create audio streams and add them to the collection */
+  astream1 =
+      new_stream ("astream1", "audio/x-stream1", GST_STREAM_TYPE_AUDIO,
+      GST_STREAM_FLAG_NONE);
+  fail_unless (gst_stream_collection_add_stream (collection, astream1));
+  fail_unless_equals_int (gst_stream_collection_get_size (collection), 1);
+
+  astream2 =
+      new_stream ("astream2", "audio/x-stream2", GST_STREAM_TYPE_AUDIO,
+      GST_STREAM_FLAG_NONE);
+  fail_unless (gst_stream_collection_add_stream (collection, astream2));
+  fail_unless_equals_int (gst_stream_collection_get_size (collection), 2);
+
+  /* Create video stream (which has no caps) */
+  vstream =
+      gst_stream_new ("vstream", NULL, GST_STREAM_TYPE_VIDEO,
+      GST_STREAM_FLAG_NONE);
+  fail_unless (gst_stream_collection_add_stream (collection, vstream));
+  fail_unless_equals_int (gst_stream_collection_get_size (collection), 3);
+
+  /* Create variant video streams and add them */
+  vstream1 =
+      new_stream ("vstream1", "video/x-stream1", GST_STREAM_TYPE_VIDEO,
+      GST_STREAM_FLAG_NONE);
+  fail_unless (gst_stream_collection_add_variant (collection, "vstream",
+          vstream1));
+  /* Number of end-user streams hasn't changed */
+  fail_unless_equals_int (gst_stream_collection_get_size (collection), 3);
+
+  vstream2 =
+      new_stream ("vstream2", "video/x-stream2", GST_STREAM_TYPE_VIDEO,
+      GST_STREAM_FLAG_NONE);
+  fail_unless (gst_stream_collection_add_variant (collection, "vstream",
+          vstream2));
+  /* Number of end-user streams hasn't changed */
+  fail_unless_equals_int (gst_stream_collection_get_size (collection), 3);
+
+  /* Adding a variant for a stream that doesn't exist should fail */
+  fail_if (gst_stream_collection_add_variant (collection, "doesn'texist",
+          vstream1));
+
+  /* Check all end-user streams are present and correct */
+  fail_unless (gst_stream_collection_get_stream (collection, 0) == astream1);
+  fail_unless (gst_stream_collection_get_stream (collection, 1) == astream2);
+  fail_unless (gst_stream_collection_get_stream (collection, 2) == vstream);
+
+  /* Check presence and validity of variants */
+  fail_unless (gst_stream_collection_is_variant_for (collection, vstream1,
+          "vstream"));
+  fail_unless (gst_stream_collection_is_variant_for (collection, vstream2,
+          "vstream"));
+  fail_if (gst_stream_collection_is_variant_for (collection, astream1,
+          "vstream"));
+
+  fail_unless_equals_string (gst_stream_collection_get_variant_of (collection,
+          "vstream1"), "vstream");
+
+  /* cleanup */
+  gst_object_unref (collection);
 }
 
 GST_END_TEST;
@@ -220,6 +417,9 @@ gst_streams_suite (void)
   suite_add_tcase (s, tc_chain);
   tcase_add_test (tc_chain, test_stream_creation);
   tcase_add_test (tc_chain, test_stream_event);
+  tcase_add_test (tc_chain, test_stream_components);
+  tcase_add_test (tc_chain, test_collection_simple);
+  tcase_add_test (tc_chain, test_collection_variants);
   tcase_add_test (tc_chain, test_notifies);
   return s;
 }

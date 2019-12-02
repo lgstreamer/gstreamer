@@ -198,11 +198,9 @@ enum
 #ifndef GST_REMOVE_DEPRECATED
   PROP_TYPEFIND,
 #endif
-  PROP_DO_TIMESTAMP
+  PROP_DO_TIMESTAMP,
+  PROP_SMART_PROPERTIES
 };
-
-#define GST_BASE_SRC_GET_PRIVATE(obj)  \
-   (G_TYPE_INSTANCE_GET_PRIVATE ((obj), GST_TYPE_BASE_SRC, GstBaseSrcPrivate))
 
 /* The basesrc implementation need to respect the following locking order:
  *   1. STREAM_LOCK
@@ -270,6 +268,7 @@ struct _GstBaseSrcPrivate
     ((src)->priv->pending_bufferlist != NULL)
 
 static GstElementClass *parent_class = NULL;
+static gint private_offset = 0;
 
 static void gst_base_src_class_init (GstBaseSrcClass * klass);
 static void gst_base_src_init (GstBaseSrc * src, gpointer g_class);
@@ -297,9 +296,19 @@ gst_base_src_get_type (void)
 
     _type = g_type_register_static (GST_TYPE_ELEMENT,
         "GstBaseSrc", &base_src_info, G_TYPE_FLAG_ABSTRACT);
+
+    private_offset =
+        g_type_add_instance_private (_type, sizeof (GstBaseSrcPrivate));
+
     g_once_init_leave (&base_src_type, _type);
   }
   return base_src_type;
+}
+
+static inline GstBaseSrcPrivate *
+gst_base_src_get_instance_private (GstBaseSrc * self)
+{
+  return (G_STRUCT_MEMBER_P (self, private_offset));
 }
 
 static GstCaps *gst_base_src_default_get_caps (GstBaseSrc * bsrc,
@@ -365,9 +374,10 @@ gst_base_src_class_init (GstBaseSrcClass * klass)
   gobject_class = G_OBJECT_CLASS (klass);
   gstelement_class = GST_ELEMENT_CLASS (klass);
 
-  GST_DEBUG_CATEGORY_INIT (gst_base_src_debug, "basesrc", 0, "basesrc element");
+  if (private_offset != 0)
+    g_type_class_adjust_private_offset (klass, &private_offset);
 
-  g_type_class_add_private (klass, sizeof (GstBaseSrcPrivate));
+  GST_DEBUG_CATEGORY_INIT (gst_base_src_debug, "basesrc", 0, "basesrc element");
 
   parent_class = g_type_class_peek_parent (klass);
 
@@ -394,6 +404,10 @@ gst_base_src_class_init (GstBaseSrcClass * klass)
       g_param_spec_boolean ("do-timestamp", "Do timestamp",
           "Apply current stream time to buffers", DEFAULT_DO_TIMESTAMP,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_SMART_PROPERTIES,
+      g_param_spec_boxed ("smart-properties", "Smart Properties",
+          "Hold various property values for reply custom query",
+          GST_TYPE_STRUCTURE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gstelement_class->change_state =
       GST_DEBUG_FUNCPTR (gst_base_src_change_state);
@@ -426,7 +440,7 @@ gst_base_src_init (GstBaseSrc * basesrc, gpointer g_class)
   GstPad *pad;
   GstPadTemplate *pad_template;
 
-  basesrc->priv = GST_BASE_SRC_GET_PRIVATE (basesrc);
+  basesrc->priv = gst_base_src_get_instance_private (basesrc);
 
   basesrc->is_live = FALSE;
   g_mutex_init (&basesrc->live_lock);
@@ -469,6 +483,9 @@ gst_base_src_init (GstBaseSrc * basesrc, gpointer g_class)
   GST_OBJECT_FLAG_SET (basesrc, GST_ELEMENT_FLAG_SOURCE);
 
   GST_DEBUG_OBJECT (basesrc, "init done");
+
+  basesrc->smart_prop = NULL;
+  basesrc->rew_eos = FALSE;
 }
 
 static void
@@ -490,6 +507,11 @@ gst_base_src_finalize (GObject * object)
     g_list_foreach (basesrc->priv->pending_events, (GFunc) gst_event_unref,
         NULL);
     g_list_free (basesrc->priv->pending_events);
+  }
+
+  if (basesrc->smart_prop) {
+    gst_structure_free (basesrc->smart_prop);
+    basesrc->smart_prop = NULL;
   }
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
@@ -881,6 +903,52 @@ gst_base_src_new_seamless_segment (GstBaseSrc * src, gint64 start, gint64 stop,
   return res;
 }
 
+/**
+ * gst_base_src_new_segment:
+ * @src: The source
+ * @segment: The new segment to be applied
+ *
+ * Prepare a new segment for emission downstream. This function must
+ * only be called by derived sub-classes, and only from the create() function,
+ * as the stream-lock needs to be held.
+ *
+ * The format for the new segment must be identical with the current format
+ * of the source, as configured with gst_base_src_set_format()
+ *
+ * Since: 1.XX
+ *
+ * Returns: %TRUE if preparation of new segment succeeded.
+ */
+gboolean
+gst_base_src_new_segment (GstBaseSrc * src, GstSegment * segment)
+{
+  g_return_val_if_fail (GST_IS_BASE_SRC (src), FALSE);
+  g_return_val_if_fail (segment != NULL, FALSE);
+
+  GST_OBJECT_LOCK (src);
+
+  if (src->segment.format != segment->format) {
+    GST_DEBUG_OBJECT (src, "segment format mismatched, ignore");
+    GST_OBJECT_UNLOCK (src);
+    return FALSE;
+  }
+
+  gst_segment_copy_into (segment, &src->segment);
+
+  /* Mark pending segment. Will be sent before next data */
+  src->priv->segment_pending = TRUE;
+  src->priv->segment_seqnum = gst_util_seqnum_next ();
+
+  GST_DEBUG_OBJECT (src, "Starting new segment %" GST_SEGMENT_FORMAT, segment);
+
+  GST_OBJECT_UNLOCK (src);
+
+  src->priv->discont = TRUE;
+  src->running = TRUE;
+
+  return TRUE;
+}
+
 /* called with STREAM_LOCK */
 static gboolean
 gst_base_src_send_stream_start (GstBaseSrc * src)
@@ -991,6 +1059,26 @@ gst_base_src_fixate (GstBaseSrc * bsrc, GstCaps * caps)
 
   return caps;
 }
+
+static gboolean
+copy_smart_properties (GQuark field_id, GValue * value, gpointer user_data)
+{
+  GstBaseSrc *src = GST_BASE_SRC (user_data);
+  const GValue *src_value;
+
+  if (!gst_structure_id_has_field (src->smart_prop, field_id)) {
+    GST_WARNING_OBJECT (src, "%s field does not exist in smart-properties",
+        g_quark_to_string (field_id));
+    return TRUE;
+  }
+
+  src_value = gst_structure_id_get_value (src->smart_prop, field_id);
+  g_value_unset (value);
+  g_value_init (value, G_VALUE_TYPE (src_value));
+  g_value_copy (src_value, value);
+  return TRUE;
+}
+
 
 static gboolean
 gst_base_src_default_query (GstBaseSrc * src, GstQuery * query)
@@ -1302,6 +1390,20 @@ gst_base_src_default_query (GstBaseSrc * src, GstQuery * query)
       }
       break;
     }
+    case GST_QUERY_CUSTOM:{
+      GstStructure *s;
+
+      s = gst_query_writable_structure (query);
+      if (gst_structure_has_name (s, "smart-properties") && src->smart_prop) {
+        GST_INFO_OBJECT (src, "got %s query", gst_structure_get_name (s));
+
+        gst_structure_map_in_place (s, copy_smart_properties, src);
+
+        res = TRUE;
+      } else
+        res = FALSE;
+      break;
+    }
     default:
       res = FALSE;
       break;
@@ -1604,7 +1706,7 @@ gst_base_src_perform_seek (GstBaseSrc * src, GstEvent * event, gboolean unlock)
   GstSeekFlags flags;
   GstSeekType start_type, stop_type;
   gint64 start, stop;
-  gboolean flush;
+  gboolean flush, rew_eos;
   gboolean update;
   gboolean relative_seek = FALSE;
   gboolean seekseg_configured = FALSE;
@@ -1639,6 +1741,17 @@ gst_base_src_perform_seek (GstBaseSrc * src, GstEvent * event, gboolean unlock)
     }
 
     flush = flags & GST_SEEK_FLAG_FLUSH;
+
+    /* If we have an GST_SEEK_FLAG_REW_EOS flags in event, src element should
+     * generate the eos event in case of TIME based backward trickplay(DLNA).
+     * The progress bar was reached to start position of stream, then demux
+     * add GST_SEEK_FLAG_REW_EOS in segment.flags */
+
+    rew_eos = flags & GST_SEEK_FLAG_REW_EOS;
+    GST_INFO_OBJECT (src, "EOS flags was detected");
+    if (rew_eos)
+      src->rew_eos = TRUE;
+
     seqnum = gst_event_get_seqnum (event);
   } else {
     flush = FALSE;
@@ -2101,6 +2214,16 @@ subclass_failed:
   }
 }
 
+static gboolean
+set_smart_properties (GQuark field_id, const GValue * value, gpointer user_data)
+{
+  GstBaseSrc *src = GST_BASE_SRC (user_data);
+
+  gst_structure_id_set_value (src->smart_prop, field_id, value);
+  return TRUE;
+}
+
+
 static void
 gst_base_src_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec)
@@ -2124,6 +2247,21 @@ gst_base_src_set_property (GObject * object, guint prop_id,
     case PROP_DO_TIMESTAMP:
       gst_base_src_set_do_timestamp (src, g_value_get_boolean (value));
       break;
+    case PROP_SMART_PROPERTIES:
+    {
+      const GstStructure *s = gst_value_get_structure (value);
+
+      if (!src->smart_prop)
+        src->smart_prop = gst_structure_copy (s);
+      else
+        gst_structure_foreach (s, set_smart_properties, src);
+
+      GST_INFO_OBJECT (src,
+          "passed structure is [%" GST_PTR_FORMAT "], result structure is [%"
+          GST_PTR_FORMAT "]", s, src->smart_prop);
+
+      break;
+    }
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -2152,6 +2290,9 @@ gst_base_src_get_property (GObject * object, guint prop_id, GValue * value,
 #endif
     case PROP_DO_TIMESTAMP:
       g_value_set_boolean (value, gst_base_src_get_do_timestamp (src));
+      break;
+    case PROP_SMART_PROPERTIES:
+      gst_value_set_structure (value, src->smart_prop);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -2373,8 +2514,15 @@ gst_base_src_update_length (GstBaseSrc * src, guint64 offset, guint * length,
   gint64 stop;
 
   /* only operate if we are working with bytes */
-  if (src->segment.format != GST_FORMAT_BYTES)
+  if (src->segment.format != GST_FORMAT_BYTES) {
+    /* generate the eos event if the progress bar reached to start of stream */
+    if (src->rew_eos) {
+      GST_INFO_OBJECT (src, "TIME based rewind reached to start of stream");
+      src->rew_eos = FALSE;
+      goto unexpected_length;
+    }
     return TRUE;
+  }
 
   bclass = GST_BASE_SRC_GET_CLASS (src);
 
@@ -2689,6 +2837,7 @@ eos:
   }
 null_buffer:
   {
+    GST_SYS_ERROR_OBJECT (src, "Internal data flow error.");
     GST_ELEMENT_ERROR (src, STREAM, FAILED,
         (_("Internal data flow error.")),
         ("Subclass %s neither returned a buffer nor submitted a buffer list "
@@ -3347,6 +3496,7 @@ no_nego_needed:
   }
 no_caps:
   {
+    GST_SYS_ERROR_OBJECT (basesrc, "No supported formats found");
     GST_ELEMENT_ERROR (basesrc, STREAM, FORMAT,
         ("No supported formats found"),
         ("This element did not produce valid caps"));

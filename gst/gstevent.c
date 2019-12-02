@@ -118,6 +118,7 @@ static GstEventQuarks event_quarks[] = {
   {GST_EVENT_EOS, "eos", 0},
   {GST_EVENT_SEGMENT_DONE, "segment-done", 0},
   {GST_EVENT_GAP, "gap", 0},
+  {GST_EVENT_STREAMS_SELECTED, "streams-selected", 0},
   {GST_EVENT_QOS, "qos", 0},
   {GST_EVENT_SEEK, "seek", 0},
   {GST_EVENT_NAVIGATION, "navigation", 0},
@@ -1002,6 +1003,152 @@ gst_event_parse_tag (GstEvent * event, GstTagList ** taglist)
   if (taglist)
     *taglist = (GstTagList *) g_value_get_boxed (val);
 }
+
+/* streams-selected event */
+/**
+ * gst_event_new_streams_selected:
+ * @collection: (transfer none): The #GstStreamCollection
+ *
+ * Creates a new steams-selected event. The event is used to announce
+ * that an array of streams has been selected. This is generally in response
+ * to a #GST_EVENT_SELECT_STREAMS event, or when an element (such as decodebin3)
+ * makes an initial selection of streams.
+ *
+ * The event also contains the #GstStreamCollection to which the various streams
+ * belong to.
+ *
+ * Users of gst_event_new_streams_selected() can add the selected streams with
+ * gst_event_streams_selected_add().
+ *
+ * Returns: a newly allocated #GstEvent
+ *
+ * Since: 1.16
+ */
+GstEvent *
+gst_event_new_streams_selected (GstStreamCollection * collection)
+{
+  GstEvent *event;
+  GstStructure *structure;
+  GValue val = G_VALUE_INIT;
+
+  g_return_val_if_fail (collection != NULL, NULL);
+  g_return_val_if_fail (GST_IS_STREAM_COLLECTION (collection), NULL);
+
+  structure =
+      gst_structure_new_id (GST_QUARK (EVENT_STREAMS_SELECTED),
+      GST_QUARK (COLLECTION), GST_TYPE_STREAM_COLLECTION, collection, NULL);
+  g_value_init (&val, GST_TYPE_ARRAY);
+  gst_structure_id_take_value (structure, GST_QUARK (STREAMS), &val);
+  event = gst_event_new_custom (GST_EVENT_STREAMS_SELECTED, structure);
+
+  return event;
+}
+
+/**
+ * gst_event_streams_selected_get_size:
+ * @event: a #GstEvent of type %GST_EVENT_STREAMS_SELECTED
+ *
+ * Returns the number of streams contained in the @event.
+ *
+ * Returns: The number of streams contained within.
+ *
+ * Since: 1.16
+ */
+guint
+gst_event_streams_selected_get_size (GstEvent * msg)
+{
+  const GValue *val;
+
+  g_return_val_if_fail (GST_IS_EVENT (msg), 0);
+  g_return_val_if_fail (GST_EVENT_TYPE (msg) == GST_EVENT_STREAMS_SELECTED, 0);
+
+  val =
+      gst_structure_id_get_value (GST_EVENT_STRUCTURE (msg),
+      GST_QUARK (STREAMS));
+  return gst_value_array_get_size (val);
+}
+
+/**
+ * gst_event_streams_selected_add:
+ * @event: a #GstEvent of type %GST_EVENT_STREAMS_SELECTED
+ * @stream: (transfer none): a #GstStream to add to @event
+ *
+ * Adds the @stream to the @event.
+ *
+ * Since: 1.16
+ */
+void
+gst_event_streams_selected_add (GstEvent * msg, GstStream * stream)
+{
+  GValue *val;
+  GValue to_add = G_VALUE_INIT;
+
+  g_return_if_fail (GST_IS_EVENT (msg));
+  g_return_if_fail (GST_EVENT_TYPE (msg) == GST_EVENT_STREAMS_SELECTED);
+  g_return_if_fail (GST_IS_STREAM (stream));
+
+  val =
+      (GValue *) gst_structure_id_get_value (GST_EVENT_STRUCTURE (msg),
+      GST_QUARK (STREAMS));
+  g_value_init (&to_add, GST_TYPE_STREAM);
+  g_value_set_object (&to_add, stream);
+  gst_value_array_append_and_take_value (val, &to_add);
+}
+
+/**
+ * gst_event_streams_selected_get_stream:
+ * @event: a #GstEvent of type %GST_EVENT_STREAMS_SELECTED
+ * @idx: Index of the stream to retrieve
+ *
+ * Retrieves the #GstStream with index @index from the @event.
+ *
+ * Returns: (transfer full) (nullable): A #GstStream
+ *
+ * Since: 1.16
+ */
+GstStream *
+gst_event_streams_selected_get_stream (GstEvent * msg, guint idx)
+{
+  const GValue *streams, *val;
+
+  g_return_val_if_fail (GST_IS_EVENT (msg), NULL);
+  g_return_val_if_fail (GST_EVENT_TYPE (msg) == GST_EVENT_STREAMS_SELECTED,
+      NULL);
+
+  streams =
+      gst_structure_id_get_value (GST_EVENT_STRUCTURE (msg),
+      GST_QUARK (STREAMS));
+  val = gst_value_array_get_value (streams, idx);
+  if (val) {
+    return (GstStream *) g_value_dup_object (val);
+  }
+
+  return NULL;
+}
+
+/**
+ * gst_event_parse_streams_selected:
+ * @event: a #GstEvent of type %GST_EVENT_STREAMS_SELECTED
+ * @collection: (out) (allow-none) (transfer full): A location where to store a
+ *  pointer to the #GstStreamCollection, or %NULL
+ *
+ * Parses a streams-selected event.
+ *
+ * Since: 1.16
+ */
+void
+gst_event_parse_streams_selected (GstEvent * event,
+    GstStreamCollection ** collection)
+{
+  g_return_if_fail (GST_IS_EVENT (event));
+  g_return_if_fail (GST_EVENT_TYPE (event) == GST_EVENT_STREAMS_SELECTED);
+
+  if (collection)
+    gst_structure_id_get (GST_EVENT_STRUCTURE (event),
+        GST_QUARK (COLLECTION), GST_TYPE_STREAM_COLLECTION, collection, NULL);
+}
+
+
 
 /* buffersize event */
 /**

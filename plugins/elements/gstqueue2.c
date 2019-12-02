@@ -118,6 +118,7 @@ enum
 #define DEFAULT_HIGH_WATERMARK     0.99
 #define DEFAULT_TEMP_REMOVE        TRUE
 #define DEFAULT_RING_BUFFER_MAX_SIZE 0
+#define DEFAULT_EOS                FALSE
 
 enum
 {
@@ -140,6 +141,7 @@ enum
   PROP_TEMP_REMOVE,
   PROP_RING_BUFFER_MAX_SIZE,
   PROP_AVG_IN_RATE,
+  PROP_EOS,
   PROP_LAST
 };
 
@@ -447,6 +449,11 @@ gst_queue2_class_init (GstQueue2Class * klass)
           "Average input data rate (bytes/s)",
           0, G_MAXINT64, 0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_EOS,
+      g_param_spec_boolean ("eos", "The status of EOS",
+          "When receiving EOS in buffering, eos will be turned on",
+          DEFAULT_EOS, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
   /* set several parent class virtual functions */
   gobject_class->finalize = gst_queue2_finalize;
 
@@ -461,6 +468,21 @@ gst_queue2_class_init (GstQueue2Class * klass)
 
   gstelement_class->change_state = GST_DEBUG_FUNCPTR (gst_queue2_change_state);
   gstelement_class->query = GST_DEBUG_FUNCPTR (gst_queue2_handle_query);
+}
+
+static void
+pad_linked (GstPad * pad, GstPad * peer, gpointer user_data)
+{
+  GstQueue2 *queue = GST_QUEUE2_CAST (user_data);
+  GstSmartPropertiesReturn ret;
+
+  ret =
+      gst_element_get_smart_properties (GST_ELEMENT_CAST (queue), "low-percent",
+      &queue->low_watermark, "dvr-playback", &queue->dvr_playback, NULL);
+
+  GST_INFO_OBJECT (queue,
+      "get smart-properties (ret %d), low-watermark : %d, dvr-playback : %d",
+      ret, queue->low_watermark, queue->dvr_playback);
 }
 
 static void
@@ -539,6 +561,11 @@ gst_queue2_init (GstQueue2 * queue)
 
   queue->ring_buffer = NULL;
   queue->ring_buffer_max_size = DEFAULT_RING_BUFFER_MAX_SIZE;
+
+  queue->dvr_playback = FALSE;
+
+  g_signal_connect (G_OBJECT (queue->sinkpad), "linked",
+      (GCallback) pad_linked, queue);
 
   GST_DEBUG_OBJECT (queue,
       "initialized queue's not_empty & not_full conditions");
@@ -2558,7 +2585,9 @@ gst_queue2_handle_sink_event (GstPad * pad, GstObject * parent,
           if (!GST_EVENT_IS_STICKY (event)) {
             goto out_flow_error;
           } else if (GST_EVENT_TYPE (event) == GST_EVENT_EOS) {
-            if (queue->srcresult == GST_FLOW_NOT_LINKED
+            if (queue->dvr_playback && queue->srcresult < GST_FLOW_EOS) {
+              GST_ELEMENT_FLOW_ERROR (queue, queue->srcresult);
+            } else if (queue->srcresult == GST_FLOW_NOT_LINKED
                 || queue->srcresult < GST_FLOW_EOS) {
               GST_ELEMENT_FLOW_ERROR (queue, queue->srcresult);
             }
@@ -2657,8 +2686,13 @@ gst_queue2_handle_sink_query (GstPad * pad, GstObject * parent,
          * completely, which can not happen if we block on the query..
          * Therefore we only potentially block when we are not buffering. */
         GST_QUEUE2_MUTEX_LOCK_CHECK (queue, queue->sinkresult, out_flushing);
+#if 0
         if (QUEUE_IS_USING_QUEUE (queue) && (gst_queue2_is_empty (queue)
                 || !queue->use_buffering)) {
+#else
+        /* Since we are using multiqueue buffering method, drop all serialized queries */
+        if (FALSE) {
+#endif
           if (!g_atomic_int_get (&queue->downstream_may_block)) {
             gst_queue2_locked_enqueue (queue, query,
                 GST_QUEUE2_ITEM_TYPE_QUERY);
@@ -3093,6 +3127,10 @@ out_flushing:
     /* let app know about us giving up if upstream is not expected to do so */
     /* EOS is already taken care of elsewhere */
     if (eos && (ret == GST_FLOW_NOT_LINKED || ret < GST_FLOW_EOS)) {
+      if (queue->dvr_playback && ret == GST_FLOW_NOT_LINKED) {
+        GST_DEBUG_OBJECT (queue, "dvr playback case, ignore not linked error");
+        return;
+      }
       GST_ELEMENT_FLOW_ERROR (queue, ret);
       gst_pad_push_event (queue->srcpad, gst_event_new_eos ());
     }
@@ -3903,6 +3941,9 @@ gst_queue2_get_property (GObject * object,
       g_value_set_int64 (value, (gint64) in_rate);
       break;
     }
+    case PROP_EOS:
+      g_value_set_boolean (value, queue->is_eos);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;

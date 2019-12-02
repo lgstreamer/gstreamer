@@ -631,7 +631,7 @@ stop_typefinding (GstTypeFindElement * typefind)
      * which is not a core bug or bug of any kind (as the default error
      * message emitted by gstpad.c otherwise would make you think) */
     if (peer && GST_PAD_CHAINFUNC (peer) == NULL) {
-      GST_DEBUG_OBJECT (typefind, "upstream only supports push mode, while "
+      GST_SYS_DEBUG_OBJECT (typefind, "upstream only supports push mode, while "
           "downstream element only works in pull mode, erroring out");
       GST_ELEMENT_ERROR (typefind, STREAM, FAILED,
           ("%s cannot work in push mode. The operation is not supported "
@@ -986,12 +986,13 @@ not_enough_data:
     GST_OBJECT_UNLOCK (typefind);
 
     if (at_eos) {
+      GST_SYS_ERROR_OBJECT (typefind, "Stream doesn't contain enough data.");
       GST_ELEMENT_ERROR (typefind, STREAM, TYPE_NOT_FOUND,
           (_("Stream doesn't contain enough data.")),
           ("Can't typefind stream"));
       return GST_FLOW_ERROR;
     } else {
-      GST_DEBUG_OBJECT (typefind, "not enough data for typefinding yet "
+      GST_SYS_DEBUG_OBJECT (typefind, "not enough data for typefinding yet "
           "(%" G_GSIZE_FORMAT " bytes)", avail);
       return GST_FLOW_OK;
     }
@@ -1008,12 +1009,13 @@ wait_for_data:
     GST_OBJECT_UNLOCK (typefind);
 
     if (at_eos) {
+      GST_SYS_ERROR_OBJECT (typefind, "Stream doesn't contain enough data.");
       GST_ELEMENT_ERROR (typefind, STREAM, TYPE_NOT_FOUND,
           (_("Stream doesn't contain enough data.")),
           ("Can't typefind stream"));
       return GST_FLOW_ERROR;
     } else {
-      GST_DEBUG_OBJECT (typefind,
+      GST_SYS_DEBUG_OBJECT (typefind,
           "no caps found with %" G_GSIZE_FORMAT " bytes of data, "
           "waiting for more data", avail);
       return GST_FLOW_OK;
@@ -1128,6 +1130,7 @@ gst_type_find_element_loop (GstPad * pad)
         /* the size if 0, we cannot continue */
         if (size == 0) {
           /* keep message in sync with message in sink event handler */
+          GST_SYS_ERROR_OBJECT (typefind, "Stream contains no data.");
           GST_ELEMENT_ERROR (typefind, STREAM, TYPE_NOT_FOUND,
               (_("Stream contains no data.")), ("Can't typefind empty stream"));
           gst_object_unref (peer);

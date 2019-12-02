@@ -104,6 +104,7 @@ EXPORTS
 	gst_base_src_is_async
 	gst_base_src_is_live
 	gst_base_src_new_seamless_segment
+	gst_base_src_new_segment
 	gst_base_src_query_latency
 	gst_base_src_set_async
 	gst_base_src_set_automatic_eos

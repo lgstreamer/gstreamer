@@ -164,6 +164,9 @@ struct _GstSelectorPad
 
   gboolean sending_cached_buffers;
   GQueue *cached_buffers;
+#ifdef NO_WAIT_HW_DECODER
+  gboolean no_wait;
+#endif
 };
 
 struct _GstSelectorPadCachedBuffer
@@ -823,6 +826,16 @@ gst_input_selector_wait_running_time (GstInputSelector * sel,
           "Waiting for active streams to advance. %" GST_TIME_FORMAT " >= %"
           GST_TIME_FORMAT, GST_TIME_ARGS (running_time),
           GST_TIME_ARGS (cur_running_time));
+
+#ifdef NO_WAIT_HW_DECODER
+      if (selpad->no_wait) {
+        selpad->no_wait = FALSE;
+        GST_INPUT_SELECTOR_UNLOCK (sel);
+        GST_WARNING_OBJECT (selpad, "dcs no wait");
+        return FALSE;
+      }
+#endif
+
       GST_INPUT_SELECTOR_WAIT (sel);
     } else {
       GST_INPUT_SELECTOR_UNLOCK (sel);
@@ -1365,9 +1378,18 @@ gst_input_selector_set_active_pad (GstInputSelector * self, GstPad * pad)
 {
   GstSelectorPad *old, *new;
   GstPad **active_pad_p;
+  GList *walk;
 
   if (pad == self->active_sinkpad)
     return FALSE;
+
+  /* guard against users setting a src pad or foreign pad as active pad */
+  if (pad != NULL) {
+    g_return_val_if_fail (GST_PAD_IS_SINK (pad), FALSE);
+    g_return_val_if_fail (GST_IS_SELECTOR_PAD (pad), FALSE);
+    g_return_val_if_fail (GST_PAD_PARENT (pad) == GST_ELEMENT_CAST (self),
+        FALSE);
+  }
 
   old = GST_SELECTOR_PAD_CAST (self->active_sinkpad);
   new = GST_SELECTOR_PAD_CAST (pad);
@@ -1381,11 +1403,39 @@ gst_input_selector_set_active_pad (GstInputSelector * self, GstPad * pad)
     new->pushed = FALSE;
 
   /* Send a new SEGMENT event on the new pad next */
-  if (old != new && new)
+  if (old != new && new) {
     new->events_pending = TRUE;
+#ifdef NO_WAIT_HW_DECODER
+    old->no_wait = TRUE;
+#endif
+  }
 
   active_pad_p = &self->active_sinkpad;
   gst_object_replace ((GstObject **) active_pad_p, GST_OBJECT_CAST (pad));
+
+  /* Sends "acquired-resource" custom event to all of sinkpad in order to
+   * inform which decoder element is active or not. */
+  for (walk = GST_ELEMENT_CAST (self)->sinkpads; walk;
+      walk = g_list_next (walk)) {
+    GstPad *sinkpad = GST_PAD_CAST (walk->data);
+
+    if (sinkpad != *active_pad_p)
+      gst_pad_push_event (sinkpad,
+          gst_event_new_custom (GST_EVENT_CUSTOM_UPSTREAM,
+              gst_structure_new ("acquired-resource",
+                  "active", G_TYPE_BOOLEAN, (sinkpad == *active_pad_p), NULL)));
+  }
+
+  for (walk = GST_ELEMENT_CAST (self)->sinkpads; walk;
+      walk = g_list_next (walk)) {
+    GstPad *sinkpad = GST_PAD_CAST (walk->data);
+
+    if (sinkpad == *active_pad_p)
+      gst_pad_push_event (sinkpad,
+          gst_event_new_custom (GST_EVENT_CUSTOM_UPSTREAM,
+              gst_structure_new ("acquired-resource",
+                  "active", G_TYPE_BOOLEAN, (sinkpad == *active_pad_p), NULL)));
+  }
 
   if (old && old != new)
     gst_pad_push_event (GST_PAD_CAST (old), gst_event_new_reconfigure ());
@@ -1544,6 +1594,25 @@ gst_input_selector_event (GstPad * pad, GstObject * parent, GstEvent * event)
         if (g_list_find (pushed_pads, eventpad)) {
           g_value_reset (&item);
           break;
+        }
+
+        /* Sends "acquired-resource" custom event to all of sinkpad in order to
+         * inform which decoder element is active or not. */
+        if (G_UNLIKELY (GST_EVENT_TYPE (event) == GST_EVENT_CUSTOM_UPSTREAM) &&
+            gst_event_has_name (event, "acquired-resource")) {
+          const GstStructure *s = NULL;
+
+          GST_INPUT_SELECTOR_LOCK (sel);
+          if (!sel->active_sinkpad)
+            gst_input_selector_get_active_sinkpad (sel);
+          GST_INPUT_SELECTOR_UNLOCK (sel);
+
+          event = (GstEvent *)
+              gst_mini_object_make_writable (GST_MINI_OBJECT_CAST (event));
+
+          s = gst_event_get_structure (event);
+          gst_structure_set ((GstStructure *) s, "active", G_TYPE_BOOLEAN,
+              gst_input_selector_is_active_sinkpad (sel, eventpad), NULL);
         }
 
         gst_event_ref (event);

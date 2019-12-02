@@ -56,6 +56,8 @@ struct _GstMultiQueue {
   gboolean sync_by_running_time;
   gboolean use_interleave;
   GstClockTime min_interleave_time;
+  gboolean is_preroll;
+  guint nb_preroll_bumping;
 
   /* number of queues */
   guint	nbqueues;
@@ -64,8 +66,9 @@ struct _GstMultiQueue {
   GList *queues;
   guint32 queues_cookie;
 
-  GstDataQueueSize  max_size, extra_size;
+  GstDataQueueSize  max_size, extra_size, base_buffering_size;
   gboolean use_buffering;
+  gboolean use_min_buffered;
   gint low_watermark, high_watermark;
   gboolean buffering;
   gint buffering_percent;
@@ -87,6 +90,8 @@ struct _GstMultiQueue {
   GstClockTimeDiff last_interleave_update;
 
   GstClockTime unlinked_cache_time;
+
+  gboolean interleave_by_serialized_event;
 };
 
 struct _GstMultiQueueClass {
@@ -95,6 +100,7 @@ struct _GstMultiQueueClass {
   /* signals emitted when ALL queues are either full or empty */
   void (*underrun)	(GstMultiQueue *queue);
   void (*overrun)	(GstMultiQueue *queue);
+  void (*preroll_state) (GstMultiQueue* queue, gboolean is_preroll);
 };
 
 G_GNUC_INTERNAL GType gst_multi_queue_get_type (void);

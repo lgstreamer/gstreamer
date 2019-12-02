@@ -147,10 +147,11 @@ struct _GstSingleQueue
 
   /* queue of data */
   GstDataQueue *queue;
-  GstDataQueueSize max_size, extra_size;
+  GstDataQueueSize max_size, extra_size, base_buffering_size;
   GstClockTime cur_time;
   gboolean is_eos;
   gboolean is_segment_done;
+  gboolean is_drained;
   gboolean is_sparse;
   gboolean flushing;
   gboolean active;
@@ -171,6 +172,10 @@ struct _GstSingleQueue
   /* For interleave calculation */
   GThread *thread;              /* Streaming thread of SingleQueue */
   GstClockTime interleave;      /* Calculated interleve within the thread */
+
+  gint buffering_level;
+
+  GstStreamType stream_type;
 };
 
 
@@ -206,6 +211,14 @@ static void recheck_buffering_status (GstMultiQueue * mq);
 static void gst_single_queue_flush_queue (GstSingleQueue * sq, gboolean full);
 
 static void calculate_interleave (GstMultiQueue * mq, GstSingleQueue * sq);
+static gboolean gst_multi_queue_bumping (GstMultiQueue * mq,
+    gboolean serialized);
+static gboolean gst_multi_queue_needs_bumping (GstMultiQueue * mq,
+    GstClockTime low, GstClockTime high, gboolean serialized);
+
+static void gst_multi_queue_get_buffered_time (GstMultiQueue * mq,
+    guint64 * audio_level, guint64 * video_level);
+static gboolean gst_multi_queue_all_eos (GstMultiQueue * mq);
 
 static GstStaticPadTemplate sinktemplate = GST_STATIC_PAD_TEMPLATE ("sink_%u",
     GST_PAD_SINK,
@@ -225,6 +238,7 @@ enum
 {
   SIGNAL_UNDERRUN,
   SIGNAL_OVERRUN,
+  SIGNAL_PREROLL_STATE,
   LAST_SIGNAL
 };
 
@@ -246,14 +260,21 @@ enum
 #define DEFAULT_EXTRA_SIZE_BUFFERS 5
 #define DEFAULT_EXTRA_SIZE_TIME 3 * GST_SECOND
 
+#define DEFAULT_BASE_BUFFERING_BYTES 0
+#define DEFAULT_BASE_BUFFERING_BUFFERS 0
+#define DEFAULT_BASE_BUFFERING_TIME 0
+
 #define DEFAULT_USE_BUFFERING FALSE
 #define DEFAULT_LOW_WATERMARK  0.01
 #define DEFAULT_HIGH_WATERMARK 0.99
 #define DEFAULT_SYNC_BY_RUNNING_TIME FALSE
 #define DEFAULT_USE_INTERLEAVE FALSE
 #define DEFAULT_UNLINKED_CACHE_TIME 250 * GST_MSECOND
+#define DEFAULT_USE_MIN_BUFFERED FALSE
 
 #define DEFAULT_MINIMUM_INTERLEAVE (250 * GST_MSECOND)
+
+#define DEFAULT_INTERLEAVE_BY_SERIALIZED_EVENT FALSE
 
 enum
 {
@@ -264,6 +285,8 @@ enum
   PROP_MAX_SIZE_BYTES,
   PROP_MAX_SIZE_BUFFERS,
   PROP_MAX_SIZE_TIME,
+  PROP_BASE_BUFFERING_BYTES,
+  PROP_BASE_BUFFERING_TIME,
   PROP_USE_BUFFERING,
   PROP_LOW_PERCENT,
   PROP_HIGH_PERCENT,
@@ -273,6 +296,12 @@ enum
   PROP_USE_INTERLEAVE,
   PROP_UNLINKED_CACHE_TIME,
   PROP_MINIMUM_INTERLEAVE,
+  PROP_USE_MIN_BUFFERED,
+  PROP_CUR_LEVEL_TIME,
+  PROP_CUR_LEVEL_TIME_AUDIO,
+  PROP_CUR_LEVEL_TIME_VIDEO,
+  PROP_EOS,
+  PROP_INTERLEAVE_BY_SERIALIZED_EVENT,
   PROP_LAST
 };
 
@@ -436,12 +465,16 @@ static void gst_multi_queue_set_property (GObject * object,
     guint prop_id, const GValue * value, GParamSpec * pspec);
 static void gst_multi_queue_get_property (GObject * object,
     guint prop_id, GValue * value, GParamSpec * pspec);
+static void gst_multi_queue_preroll_state_action (GstMultiQueue * queue,
+    gboolean is_preroll);
 
 static GstPad *gst_multi_queue_request_new_pad (GstElement * element,
     GstPadTemplate * temp, const gchar * name, const GstCaps * caps);
 static void gst_multi_queue_release_pad (GstElement * element, GstPad * pad);
 static GstStateChangeReturn gst_multi_queue_change_state (GstElement *
     element, GstStateChange transition);
+static gboolean gst_multi_queue_send_event (GstElement * element,
+    GstEvent * event);
 
 static void gst_multi_queue_loop (GstPad * pad);
 
@@ -494,6 +527,21 @@ gst_multi_queue_class_init (GstMultiQueueClass * klass)
       G_STRUCT_OFFSET (GstMultiQueueClass, overrun), NULL, NULL,
       g_cclosure_marshal_VOID__VOID, G_TYPE_NONE, 0);
 
+  /**
+   * GstMultiQueue::preroll-state:
+   * @multiqueue: the multiqueue instance
+   *
+   * Dynamically set the max-size-time based on preroll states.
+   * If decoder elements emit signal and they are under preroll, max-size-time
+   * will be properly increased until get notification from decoder
+   */
+  /* FIXME : NEED MORE CLEAR */
+  gst_multi_queue_signals[SIGNAL_PREROLL_STATE] =
+      g_signal_new ("preroll-state", G_TYPE_FROM_CLASS (klass),
+      G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+      G_STRUCT_OFFSET (GstMultiQueueClass, preroll_state), NULL, NULL,
+      g_cclosure_marshal_VOID__BOOLEAN, G_TYPE_NONE, 1, G_TYPE_BOOLEAN);
+
   /* PROPERTIES */
 
   g_object_class_install_property (gobject_class, PROP_MAX_SIZE_BYTES,
@@ -533,6 +581,19 @@ gst_multi_queue_class_init (GstMultiQueueClass * klass)
           0, G_MAXUINT64, DEFAULT_EXTRA_SIZE_TIME,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_BASE_BUFFERING_BYTES,
+      g_param_spec_uint ("base-buffering-bytes", "Base Buffering Size (kB)",
+          "Base buffering size with interleave enabled (bytes, 0=disable)"
+          "(by LG TVL)",
+          0, G_MAXUINT, DEFAULT_BASE_BUFFERING_BYTES,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_BASE_BUFFERING_TIME,
+      g_param_spec_uint64 ("base-buffering-time", "Base Buffering Size (ns)",
+          "Base buffering size with interleave enabled (ns, 0=disable)"
+          "(by LG TVL)",
+          0, G_MAXUINT64, DEFAULT_BASE_BUFFERING_TIME,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   /**
    * GstMultiQueue:use-buffering:
    *
@@ -545,7 +606,17 @@ gst_multi_queue_class_init (GstMultiQueueClass * klass)
           DEFAULT_USE_BUFFERING, G_PARAM_READWRITE | GST_PARAM_MUTABLE_PLAYING |
           G_PARAM_STATIC_STRINGS));
   /**
-   * GstMultiQueue:low-percent:
+   * GstMultiQueue:use-min-buffered
+   *
+   * Calculate buffering level based on the lowest buffering level among singelqueues
+   */
+  g_object_class_install_property (gobject_class, PROP_USE_MIN_BUFFERED,
+      g_param_spec_boolean ("use-min-buffered", "Use min buffered",
+          "Calculate buffering level based on the lowest one",
+          DEFAULT_USE_MIN_BUFFERED, G_PARAM_READWRITE |
+          GST_PARAM_MUTABLE_PLAYING | G_PARAM_STATIC_STRINGS));
+  /**
+   * GstMultiQueue:low-percent
    *
    * Low threshold percent for buffering to start.
    */
@@ -625,6 +696,35 @@ gst_multi_queue_class_init (GstMultiQueueClass * klass)
           G_PARAM_READWRITE | GST_PARAM_MUTABLE_PLAYING |
           G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_CUR_LEVEL_TIME,
+      g_param_spec_uint64 ("current-level-time", "Current level (ns)",
+          "Current amount of data in the multiqueue (in ns)",
+          0, G_MAXUINT64, 0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_CUR_LEVEL_TIME_AUDIO,
+      g_param_spec_uint64 ("current-level-time-audio",
+          "Current level audio (ns)",
+          "Current amount of audio data in the multiqueue (in ns)",
+          0, G_MAXUINT64, 0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_CUR_LEVEL_TIME_VIDEO,
+      g_param_spec_uint64 ("current-level-time-video",
+          "Current level video (ns)",
+          "Current amount of video data in the multiqueue (in ns)",
+          0, G_MAXUINT64, 0, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_EOS,
+      g_param_spec_boolean ("eos", "The status of EOS",
+          "When receiving EOS in buffering, eos will be turned on",
+          FALSE, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class,
+      PROP_INTERLEAVE_BY_SERIALIZED_EVENT,
+      g_param_spec_boolean ("interleave-by-serialized-event",
+          "Interleave by serialized event", "Interleave by serialized event",
+          DEFAULT_INTERLEAVE_BY_SERIALIZED_EVENT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   gobject_class->finalize = gst_multi_queue_finalize;
 
   gst_element_class_set_static_metadata (gstelement_class,
@@ -640,6 +740,10 @@ gst_multi_queue_class_init (GstMultiQueueClass * klass)
       GST_DEBUG_FUNCPTR (gst_multi_queue_release_pad);
   gstelement_class->change_state =
       GST_DEBUG_FUNCPTR (gst_multi_queue_change_state);
+  gstelement_class->send_event = GST_DEBUG_FUNCPTR (gst_multi_queue_send_event);
+
+  klass->preroll_state =
+      GST_DEBUG_FUNCPTR (gst_multi_queue_preroll_state_action);
 }
 
 static void
@@ -656,7 +760,12 @@ gst_multi_queue_init (GstMultiQueue * mqueue)
   mqueue->extra_size.visible = DEFAULT_EXTRA_SIZE_BUFFERS;
   mqueue->extra_size.time = DEFAULT_EXTRA_SIZE_TIME;
 
+  mqueue->base_buffering_size.bytes = DEFAULT_BASE_BUFFERING_BYTES;
+  mqueue->base_buffering_size.visible = DEFAULT_BASE_BUFFERING_BUFFERS;
+  mqueue->base_buffering_size.time = DEFAULT_BASE_BUFFERING_TIME;
+
   mqueue->use_buffering = DEFAULT_USE_BUFFERING;
+  mqueue->use_min_buffered = DEFAULT_USE_MIN_BUFFERED;
   mqueue->low_watermark = DEFAULT_LOW_WATERMARK * MAX_BUFFERING_LEVEL;
   mqueue->high_watermark = DEFAULT_HIGH_WATERMARK * MAX_BUFFERING_LEVEL;
 
@@ -664,10 +773,15 @@ gst_multi_queue_init (GstMultiQueue * mqueue)
   mqueue->use_interleave = DEFAULT_USE_INTERLEAVE;
   mqueue->min_interleave_time = DEFAULT_MINIMUM_INTERLEAVE;
   mqueue->unlinked_cache_time = DEFAULT_UNLINKED_CACHE_TIME;
+  mqueue->interleave_by_serialized_event =
+      DEFAULT_INTERLEAVE_BY_SERIALIZED_EVENT;
 
   mqueue->counter = 1;
   mqueue->highid = -1;
   mqueue->high_time = GST_CLOCK_STIME_NONE;
+
+  mqueue->is_preroll = FALSE;
+  mqueue->nb_preroll_bumping = 0;
 
   g_mutex_init (&mqueue->qlock);
   g_mutex_init (&mqueue->buffering_post_lock);
@@ -690,16 +804,28 @@ gst_multi_queue_finalize (GObject * object)
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
 
-#define SET_CHILD_PROPERTY(mq,format) G_STMT_START {	        \
-    GList * tmp = mq->queues;					\
-    while (tmp) {						\
-      GstSingleQueue *q = (GstSingleQueue*)tmp->data;		\
-      q->max_size.format = mq->max_size.format;                 \
-      update_buffering (mq, q);                                 \
-      gst_data_queue_limits_changed (q->queue);                 \
-      tmp = g_list_next(tmp);					\
-    };								\
+#define SET_CHILD_PROPERTY(mq,format) G_STMT_START {  \
+    GList * tmp = mq->queues;                         \
+    while (tmp) {                                     \
+      GstSingleQueue *q = (GstSingleQueue*)tmp->data; \
+      q->max_size.format = mq->max_size.format;       \
+      update_buffering (mq, q);                       \
+      gst_data_queue_limits_changed (q->queue);       \
+      tmp = g_list_next(tmp);                         \
+    };                                                \
 } G_STMT_END
+
+#define SET_BASE_BUFFER_PROPERTY(mq,format) G_STMT_START {            \
+    GList * tmp = mq->queues;                                         \
+    while (tmp) {                                                     \
+      GstSingleQueue *q = (GstSingleQueue*)tmp->data;                 \
+      q->base_buffering_size.format = mq->base_buffering_size.format; \
+      update_buffering (mq, q);                                       \
+      gst_data_queue_limits_changed (q->queue);                       \
+      tmp = g_list_next(tmp);                                         \
+    };                                                                \
+} G_STMT_END
+
 
 static void
 gst_multi_queue_set_property (GObject * object, guint prop_id,
@@ -714,6 +840,7 @@ gst_multi_queue_set_property (GObject * object, guint prop_id,
       SET_CHILD_PROPERTY (mq, bytes);
       GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
       gst_multi_queue_post_buffering (mq);
+      GST_INFO_OBJECT (mq, "Set max size bytes %d", mq->max_size.bytes);
       break;
     case PROP_MAX_SIZE_BUFFERS:
     {
@@ -750,7 +877,7 @@ gst_multi_queue_set_property (GObject * object, guint prop_id,
 
       GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
       gst_multi_queue_post_buffering (mq);
-
+      GST_INFO_OBJECT (mq, "Set max size buffer %d", mq->max_size.visible);
       break;
     }
     case PROP_MAX_SIZE_TIME:
@@ -759,6 +886,8 @@ gst_multi_queue_set_property (GObject * object, guint prop_id,
       SET_CHILD_PROPERTY (mq, time);
       GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
       gst_multi_queue_post_buffering (mq);
+      GST_INFO_OBJECT (mq, "Set max size time %" G_GUINT64_FORMAT,
+          mq->max_size.time);
       break;
     case PROP_EXTRA_SIZE_BYTES:
       mq->extra_size.bytes = g_value_get_uint (value);
@@ -769,9 +898,32 @@ gst_multi_queue_set_property (GObject * object, guint prop_id,
     case PROP_EXTRA_SIZE_TIME:
       mq->extra_size.time = g_value_get_uint64 (value);
       break;
+    case PROP_BASE_BUFFERING_BYTES:
+      GST_MULTI_QUEUE_MUTEX_LOCK (mq);
+      mq->base_buffering_size.bytes = g_value_get_uint (value);
+      SET_BASE_BUFFER_PROPERTY (mq, bytes);
+      GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
+      gst_multi_queue_post_buffering (mq);
+      GST_INFO_OBJECT (mq, "Set base buffering bytes %d",
+          mq->base_buffering_size.bytes);
+      break;
+    case PROP_BASE_BUFFERING_TIME:
+      GST_MULTI_QUEUE_MUTEX_LOCK (mq);
+      mq->base_buffering_size.time = g_value_get_uint64 (value);
+      SET_BASE_BUFFER_PROPERTY (mq, time);
+      GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
+      gst_multi_queue_post_buffering (mq);
+      GST_INFO_OBJECT (mq, "Set base buffering time %" G_GUINT64_FORMAT,
+          mq->base_buffering_size.time);
+      break;
     case PROP_USE_BUFFERING:
       mq->use_buffering = g_value_get_boolean (value);
       recheck_buffering_status (mq);
+      break;
+    case PROP_USE_MIN_BUFFERED:
+      mq->use_min_buffered = g_value_get_boolean (value);
+      recheck_buffering_status (mq);
+      GST_INFO_OBJECT (mq, "Set use min buffered %d", mq->use_min_buffered);
       break;
     case PROP_LOW_PERCENT:
       mq->low_watermark = g_value_get_int (value) * BUF_LEVEL_PERCENT_FACTOR;
@@ -788,16 +940,19 @@ gst_multi_queue_set_property (GObject * object, guint prop_id,
     case PROP_LOW_WATERMARK:
       mq->low_watermark = g_value_get_double (value) * MAX_BUFFERING_LEVEL;
       recheck_buffering_status (mq);
+      GST_INFO_OBJECT (mq, "Set low watermark %d", mq->low_watermark);
       break;
     case PROP_HIGH_WATERMARK:
       mq->high_watermark = g_value_get_double (value) * MAX_BUFFERING_LEVEL;
       recheck_buffering_status (mq);
+      GST_INFO_OBJECT (mq, "Set high watermark %d", mq->high_watermark);
       break;
     case PROP_SYNC_BY_RUNNING_TIME:
       mq->sync_by_running_time = g_value_get_boolean (value);
       break;
     case PROP_USE_INTERLEAVE:
       mq->use_interleave = g_value_get_boolean (value);
+      GST_INFO_OBJECT (mq, "Set use-interleave %d", mq->use_interleave);
       break;
     case PROP_UNLINKED_CACHE_TIME:
       GST_MULTI_QUEUE_MUTEX_LOCK (mq);
@@ -811,6 +966,13 @@ gst_multi_queue_set_property (GObject * object, guint prop_id,
       if (mq->use_interleave)
         calculate_interleave (mq, NULL);
       GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
+      GST_INFO_OBJECT (mq, "Set minimum interleave %" G_GUINT64_FORMAT,
+          mq->min_interleave_time);
+      break;
+    case PROP_INTERLEAVE_BY_SERIALIZED_EVENT:
+      mq->interleave_by_serialized_event = g_value_get_boolean (value);
+      GST_INFO_OBJECT (mq, "Set interleave-by-serialized-event %d",
+          mq->interleave_by_serialized_event);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -845,8 +1007,17 @@ gst_multi_queue_get_property (GObject * object, guint prop_id,
     case PROP_MAX_SIZE_TIME:
       g_value_set_uint64 (value, mq->max_size.time);
       break;
+    case PROP_BASE_BUFFERING_BYTES:
+      g_value_set_uint (value, mq->base_buffering_size.bytes);
+      break;
+    case PROP_BASE_BUFFERING_TIME:
+      g_value_set_uint64 (value, mq->base_buffering_size.time);
+      break;
     case PROP_USE_BUFFERING:
       g_value_set_boolean (value, mq->use_buffering);
+      break;
+    case PROP_USE_MIN_BUFFERED:
+      g_value_set_boolean (value, mq->use_min_buffered);
       break;
     case PROP_LOW_PERCENT:
       g_value_set_int (value, mq->low_watermark / BUF_LEVEL_PERCENT_FACTOR);
@@ -873,6 +1044,36 @@ gst_multi_queue_get_property (GObject * object, guint prop_id,
       break;
     case PROP_MINIMUM_INTERLEAVE:
       g_value_set_uint64 (value, mq->min_interleave_time);
+      break;
+    case PROP_CUR_LEVEL_TIME:
+    {
+      guint64 audio_level, video_level;
+      gst_multi_queue_get_buffered_time (mq, &audio_level, &video_level);
+      g_value_set_uint64 (value,
+          audio_level < video_level ? audio_level : video_level);
+    }
+      break;
+    case PROP_CUR_LEVEL_TIME_AUDIO:
+    {
+      guint64 audio_level;
+      gst_multi_queue_get_buffered_time (mq, &audio_level, NULL);
+      g_value_set_uint64 (value, audio_level);
+    }
+      break;
+    case PROP_CUR_LEVEL_TIME_VIDEO:
+    {
+      guint64 video_level;
+      gst_multi_queue_get_buffered_time (mq, NULL, &video_level);
+      g_value_set_uint64 (value, video_level);
+    }
+      break;
+    case PROP_EOS:
+    {
+      g_value_set_boolean (value, gst_multi_queue_all_eos (mq));
+    }
+      break;
+    case PROP_INTERLEAVE_BY_SERIALIZED_EVENT:
+      g_value_set_boolean (value, mq->interleave_by_serialized_event);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -1030,6 +1231,8 @@ gst_multi_queue_change_state (GstElement * element, GstStateChange transition)
         sq->last_query = FALSE;
         g_cond_signal (&sq->query_handled);
       }
+      mqueue->is_preroll = FALSE;
+      mqueue->nb_preroll_bumping = 0;
       GST_MULTI_QUEUE_MUTEX_UNLOCK (mqueue);
       break;
     }
@@ -1047,6 +1250,82 @@ gst_multi_queue_change_state (GstElement * element, GstStateChange transition)
   return result;
 }
 
+static void
+gst_multi_queue_preroll_state_action (GstMultiQueue * queue,
+    gboolean is_preroll)
+{
+  GST_FIXME_OBJECT (queue, "preroll state = %d", is_preroll);
+  queue->is_preroll = is_preroll;
+  if (!is_preroll)
+    queue->nb_preroll_bumping = 0;
+
+  return;
+}
+
+static GstStreamType
+guess_stream_type_from_caps (GstCaps * caps)
+{
+  GstStructure *s;
+  const gchar *name;
+
+  if (gst_caps_get_size (caps) < 1)
+    return GST_STREAM_TYPE_UNKNOWN;
+
+  s = gst_caps_get_structure (caps, 0);
+  name = gst_structure_get_name (s);
+
+  if (g_str_has_prefix (name, "video/") || g_str_has_prefix (name, "image/"))
+    return GST_STREAM_TYPE_VIDEO;
+  if (g_str_has_prefix (name, "audio/"))
+    return GST_STREAM_TYPE_AUDIO;
+  if (g_str_has_prefix (name, "text/") ||
+      g_str_has_prefix (name, "subpicture/"))
+    return GST_STREAM_TYPE_TEXT;
+
+  return GST_STREAM_TYPE_UNKNOWN;
+}
+
+static gboolean
+gst_multi_queue_send_event (GstElement * element, GstEvent * event)
+{
+  gboolean res = FALSE;
+  GstMultiQueue *mq = GST_MULTI_QUEUE (element);
+
+  GST_LOG_OBJECT (mq, "Got event %s", GST_EVENT_TYPE_NAME (event));
+
+  switch (GST_EVENT_TYPE (event)) {
+    case GST_EVENT_SEEK:{
+      GList *iter;
+
+      for (iter = mq->queues; iter; iter = g_list_next (iter)) {
+        GstSingleQueue *sq = (GstSingleQueue *) iter->data;
+        if (sq->sinkpad) {
+          GstCaps *caps = gst_pad_get_current_caps (sq->sinkpad);
+          if (caps &&
+              (guess_stream_type_from_caps (caps) == GST_STREAM_TYPE_VIDEO)) {
+            res = gst_pad_push_event (sq->sinkpad, event);
+            gst_caps_unref (caps);
+            return res;
+          }
+          if (caps)
+            gst_caps_unref (caps);
+        }
+      }
+
+      res =
+          GST_ELEMENT_CLASS (gst_multi_queue_parent_class)->send_event (element,
+          event);
+    }
+      break;
+    default:
+      res =
+          GST_ELEMENT_CLASS (gst_multi_queue_parent_class)->send_event (element,
+          event);
+      break;
+  }
+  return res;
+}
+
 static gboolean
 gst_single_queue_start (GstMultiQueue * mq, GstSingleQueue * sq)
 {
@@ -1060,8 +1339,9 @@ gst_single_queue_pause (GstMultiQueue * mq, GstSingleQueue * sq)
 {
   gboolean result;
 
-  GST_LOG_OBJECT (mq, "SingleQueue %d : pausing task", sq->id);
+  GST_SYS_DEBUG_OBJECT (mq, "SingleQueue %d : pausing task", sq->id);
   result = gst_pad_pause_task (sq->srcpad);
+  GST_SYS_DEBUG_OBJECT (mq, "SingleQueue %d : paused task", sq->id);
   sq->sink_tainted = sq->src_tainted = TRUE;
   return result;
 }
@@ -1112,6 +1392,7 @@ gst_single_queue_flush (GstMultiQueue * mq, GstSingleQueue * sq, gboolean flush,
     sq->max_size.visible = mq->max_size.visible;
     sq->is_eos = FALSE;
     sq->is_segment_done = FALSE;
+    sq->is_drained = FALSE;
     sq->nextid = 0;
     sq->oldid = 0;
     sq->last_oldid = G_MAXUINT32;
@@ -1148,7 +1429,7 @@ get_buffering_level (GstSingleQueue * sq)
 
   /* get bytes and time buffer levels and take the max */
   if (sq->is_eos || sq->is_segment_done || sq->srcresult == GST_FLOW_NOT_LINKED
-      || sq->is_sparse) {
+      || sq->is_sparse || !gst_pad_is_linked (sq->srcpad)) {
     buffering_level = MAX_BUFFERING_LEVEL;
   } else {
     buffering_level = 0;
@@ -1169,6 +1450,157 @@ get_buffering_level (GstSingleQueue * sq)
   return buffering_level;
 }
 
+#define IS_FILLED(q, format, value) ((((q)->max_size.format) != 0 || \
+     ((q)->base_buffering_size.format != 0)) && \
+     ((q)->max_size.format + (q)->base_buffering_size.format) <= (value))
+
+static gint
+get_base_buffering_size_level (GstSingleQueue * sq)
+{
+  GstDataQueueSize size;
+  gint buffering_level, tmp;
+
+  gst_data_queue_get_level (sq->queue, &size);
+
+  GST_DEBUG_OBJECT (sq->mqueue,
+      "queue %d: visible %u/%u, bytes %u/%u, time %" G_GUINT64_FORMAT "/%"
+      G_GUINT64_FORMAT, sq->id, size.visible, sq->max_size.visible,
+      size.bytes, sq->base_buffering_size.bytes, sq->cur_time,
+      sq->base_buffering_size.time);
+
+  /* get bytes and time buffer levels and take the max */
+  if (sq->is_eos || sq->srcresult == GST_FLOW_NOT_LINKED || sq->is_sparse ||
+      !gst_pad_is_linked (sq->srcpad) || IS_FILLED (sq, bytes, size.bytes)) {
+    buffering_level = MAX_BUFFERING_LEVEL;
+  } else {
+    buffering_level = 0;
+    if (sq->base_buffering_size.time > 0) {
+      tmp =
+          gst_util_uint64_scale (sq->cur_time,
+          MAX_BUFFERING_LEVEL, sq->base_buffering_size.time);
+      buffering_level = MAX (buffering_level, tmp);
+    }
+    if (sq->base_buffering_size.bytes > 0) {
+      tmp =
+          gst_util_uint64_scale_int (size.bytes,
+          MAX_BUFFERING_LEVEL, sq->base_buffering_size.bytes);
+      buffering_level = MAX (buffering_level, tmp);
+    }
+  }
+
+  return buffering_level;
+}
+
+static void
+gst_multi_queue_get_buffered_time (GstMultiQueue * mq, guint64 * audio_level,
+    guint64 * video_level)
+{
+  guint64 min_audio = GST_CLOCK_TIME_NONE;
+  guint64 min_video = GST_CLOCK_TIME_NONE;
+
+  GList *iter;
+  for (iter = mq->queues; iter; iter = g_list_next (iter)) {
+    GstSingleQueue *sq = (GstSingleQueue *) iter->data;
+
+    if (sq->is_eos || sq->srcresult == GST_FLOW_NOT_LINKED || sq->is_sparse ||
+        !gst_pad_is_linked (sq->srcpad))
+      continue;
+
+    if (sq->stream_type == GST_STREAM_TYPE_AUDIO) {
+      if (min_audio == GST_CLOCK_TIME_NONE || sq->cur_time < min_audio)
+        min_audio = sq->cur_time;
+    } else {
+      /* Assuming unknown/complex type as video */
+      if (min_video == GST_CLOCK_TIME_NONE || sq->cur_time < min_video)
+        min_video = sq->cur_time;
+    }
+  }
+
+  if (audio_level)
+    *audio_level = min_audio;
+  if (video_level)
+    *video_level = min_video;
+}
+
+static gboolean
+gst_multi_queue_all_eos (GstMultiQueue * mq)
+{
+  GList *iter;
+  gboolean ret = TRUE;
+
+  if (!mq->queues)
+    return FALSE;
+
+  for (iter = mq->queues; iter; iter = g_list_next (iter)) {
+    GstSingleQueue *sq = (GstSingleQueue *) iter->data;
+
+    if (sq->is_eos || sq->is_drained)
+      continue;
+
+    ret = FALSE;
+    break;
+  }
+
+  return ret;
+}
+
+static void
+update_buffering_by_minimum (GstMultiQueue * mq, GstSingleQueue * sq)
+{
+  gint percent, min_level = MAX_BUFFERING_LEVEL;
+
+  if (mq->buffering) {
+    GList *iter;
+    for (iter = mq->queues; iter; iter = g_list_next (iter)) {
+      GstSingleQueue *oq = (GstSingleQueue *) iter->data;
+      gint buffering_level = 0;
+      if (oq->base_buffering_size.time || oq->base_buffering_size.bytes)
+        buffering_level = get_base_buffering_size_level (oq);
+      else
+        buffering_level = get_buffering_level (oq);
+
+      if (buffering_level < min_level)
+        min_level = buffering_level;
+    }
+    percent = gst_util_uint64_scale (min_level, 100, mq->high_watermark);
+
+    if (percent > 100)
+      percent = 100;
+
+    if (min_level >= mq->high_watermark) {
+      mq->buffering = FALSE;
+    }
+
+    SET_PERCENT (mq, percent);
+  } else if (sq->buffering_level < mq->low_watermark) {
+    if (mq->use_interleave) {
+      GList *iter;
+      gboolean is_filled = FALSE;
+      for (iter = mq->queues; iter; iter = g_list_next (iter)) {
+        GstSingleQueue *oq = (GstSingleQueue *) iter->data;
+        if (gst_data_queue_is_full (oq->queue)) {
+          is_filled = TRUE;
+          break;
+        }
+      }
+      if (!is_filled) {
+        mq->buffering = TRUE;
+        percent =
+            gst_util_uint64_scale (sq->buffering_level, 100,
+            mq->high_watermark);
+        SET_PERCENT (mq, percent);
+        GST_LOG_OBJECT (mq, "going to buffering : %d -> %d percent", sq->id,
+            percent);
+      }
+    } else {
+      mq->buffering = TRUE;
+      percent =
+          gst_util_uint64_scale (sq->buffering_level, 100, mq->high_watermark);
+      SET_PERCENT (mq, percent);
+    }
+  }
+}
+
 /* WITH LOCK TAKEN */
 static void
 update_buffering (GstMultiQueue * mq, GstSingleQueue * sq)
@@ -1179,7 +1611,20 @@ update_buffering (GstMultiQueue * mq, GstSingleQueue * sq)
   if (!mq->use_buffering)
     return;
 
-  buffering_level = get_buffering_level (sq);
+  if (sq->base_buffering_size.time || sq->base_buffering_size.bytes)
+    buffering_level = get_base_buffering_size_level (sq);
+  else
+    buffering_level = get_buffering_level (sq);
+  sq->buffering_level = buffering_level;
+
+  if (mq->use_min_buffered) {
+    update_buffering_by_minimum (mq, sq);
+    return;
+  }
+
+  /* do not update buffering level for the  sparse stream */
+  if (sq->is_sparse || !gst_pad_is_linked (sq->srcpad))
+    return;
 
   /* scale so that if buffering_level equals the high watermark,
    * the percentage is 100% */
@@ -1188,6 +1633,7 @@ update_buffering (GstMultiQueue * mq, GstSingleQueue * sq)
   if (percent > 100)
     percent = 100;
 
+  GST_LOG_OBJECT (mq, "queue %d buffering level %d", sq->id, percent);
   if (mq->buffering) {
     if (buffering_level >= mq->high_watermark) {
       mq->buffering = FALSE;
@@ -1203,7 +1649,11 @@ update_buffering (GstMultiQueue * mq, GstSingleQueue * sq)
     for (iter = mq->queues; iter; iter = g_list_next (iter)) {
       GstSingleQueue *oq = (GstSingleQueue *) iter->data;
 
-      if (get_buffering_level (oq) >= mq->high_watermark) {
+      /* ignore the sparse stream */
+      if (oq->is_sparse || !gst_pad_is_linked (oq->srcpad))
+        continue;
+
+      if (oq->buffering_level >= mq->high_watermark) {
         is_buffering = FALSE;
 
         break;
@@ -1238,6 +1688,219 @@ gst_multi_queue_post_buffering (GstMultiQueue * mq)
     gst_element_post_message (GST_ELEMENT_CAST (mq), msg);
 
   g_mutex_unlock (&mq->buffering_post_lock);
+}
+
+static gboolean
+gst_multi_queue_bumping (GstMultiQueue * mq, gboolean serialized)
+{
+  GstClockTime low, high;
+  GList *tmp;
+
+  low = high = GST_CLOCK_TIME_NONE;
+
+  /* Go over all single queues and calculate lowest/highest value */
+  for (tmp = mq->queues; tmp; tmp = tmp->next) {
+    GstSingleQueue *sq = (GstSingleQueue *) tmp->data;
+
+    if (sq->is_sparse)
+      continue;
+
+    if (!sq->active) {
+      GST_LOG_OBJECT (mq, "Single Queue: %d is not active", sq->id);
+      return FALSE;
+    }
+
+    if (GST_CLOCK_TIME_IS_VALID (sq->cur_time)) {
+      if (low == GST_CLOCK_TIME_NONE || sq->cur_time < low)
+        low = sq->cur_time;
+      if (high == GST_CLOCK_TIME_NONE || sq->cur_time > high)
+        high = sq->cur_time;
+    }
+    GST_FIXME_OBJECT (mq,
+        "queue %d , sinktime:%" GST_STIME_FORMAT " low:%" GST_TIME_FORMAT
+        " high:%" GST_TIME_FORMAT, sq->id,
+        GST_STIME_ARGS (sq->cached_sinktime), GST_TIME_ARGS (low),
+        GST_TIME_ARGS (high));
+  }
+
+  if (GST_CLOCK_TIME_IS_VALID (low) && GST_CLOCK_TIME_IS_VALID (high)) {
+    return gst_multi_queue_needs_bumping (mq, low, high, serialized);
+  }
+
+  return FALSE;
+}
+
+static gboolean
+gst_multi_queue_needs_bumping (GstMultiQueue * mq, GstClockTime low,
+    GstClockTime high, gboolean serialized)
+{
+  GList *tmp;
+  GstClockTime cur_max_time;
+  gboolean need_bumping = FALSE;
+  gboolean is_overrun_time = FALSE;
+  gboolean is_overrun_bytes = FALSE;
+  GstStreamType overrun_stream_types = GST_STREAM_TYPE_UNKNOWN;
+  GstStreamType underrun_stream_types = GST_STREAM_TYPE_UNKNOWN;
+  GstClockTime estimated_max_time = GST_CLOCK_TIME_NONE;
+  GstClockTime overrun_max_time = GST_CLOCK_TIME_NONE;
+  guint overrun_max_bytes = 0;
+
+  gboolean is_preroll = mq->is_preroll;
+
+  /* FIXME : Fixed to start from 5 second */
+  if (mq->interleave == GST_CLOCK_TIME_NONE) {
+    mq->interleave = 5 * GST_SECOND;
+    /* Update max-size time */
+    mq->max_size.time = mq->interleave;
+    SET_CHILD_PROPERTY (mq, time);
+  }
+
+  cur_max_time = mq->max_size.time;
+
+  for (tmp = mq->queues; tmp; tmp = g_list_next (tmp)) {
+    GstSingleQueue *sq = (GstSingleQueue *) tmp->data;
+    GstDataQueueSize size;
+
+    gst_data_queue_get_level (sq->queue, &size);
+
+    GST_FIXME_OBJECT (mq,
+        "Single Queue %d: EOS %d, visible %u/%u, bytes %u/%u, time %"
+        G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT, sq->id, sq->is_eos,
+        size.visible, sq->max_size.visible, size.bytes, sq->max_size.bytes,
+        sq->cur_time, sq->max_size.time);
+
+    if (sq->is_sparse)
+      continue;
+
+    if (sq->cur_time >= sq->max_size.time) {
+      GST_FIXME_OBJECT (mq, "Overrun, Single Queue %d in time", sq->id);
+      is_overrun_time = TRUE;
+      if (overrun_max_time == GST_CLOCK_TIME_NONE ||
+          (overrun_max_time < sq->cur_time)) {
+        overrun_max_time = sq->cur_time;
+      }
+      overrun_stream_types |= sq->groupid;
+    }
+
+    /* FIXME, check overrun in bytes when serialized event */
+    if (serialized && size.bytes >= sq->max_size.bytes) {
+      GST_FIXME_OBJECT (mq, "Overrun, Singele Queue %d in bytes", sq->id);
+      is_overrun_bytes = TRUE;
+      if (overrun_max_bytes < size.bytes) {
+        overrun_max_bytes = size.bytes;
+      }
+      if (!(overrun_stream_types & sq->groupid))
+        overrun_stream_types |= sq->groupid;
+    }
+
+    if (sq->cur_time == 0 && size.bytes == 0) {
+      GST_FIXME_OBJECT (mq, "Underrun, Single Queue %d", sq->id);
+      underrun_stream_types |= sq->groupid;
+    }
+  }
+
+  /* FIXME, Estimate bumping max-size-time and bytes */
+  if (is_preroll) {
+    gint percent = 100;
+    GstClockTime diff_gap = GST_CLOCK_STIME_NONE;
+
+    diff_gap = high - low;
+    diff_gap = (150 * diff_gap / 100) + 250 * GST_MSECOND;
+
+    GST_FIXME_OBJECT (mq,
+        "diff_gap:%" GST_STIME_FORMAT " max-time:%" GST_STIME_FORMAT,
+        GST_STIME_ARGS (diff_gap), GST_STIME_ARGS (cur_max_time));
+
+    if (cur_max_time > 0)
+      percent = (diff_gap * 100) / cur_max_time;
+
+    GST_FIXME_OBJECT (mq,
+        "percent:%d diff_gap:%" GST_STIME_FORMAT " max time:%" GST_STIME_FORMAT,
+        percent, GST_STIME_ARGS (diff_gap), GST_STIME_ARGS (cur_max_time));
+
+    if (percent >= 70 || mq->nb_preroll_bumping == 0) {
+      GstClockTime p_interleave = mq->interleave;
+      GST_FIXME_OBJECT (mq, "[Preroll] Needs bumping up!!");
+      mq->nb_preroll_bumping++;
+      need_bumping = TRUE;
+
+      if (mq->nb_preroll_bumping > 1) {
+        estimated_max_time = p_interleave + (250 * GST_MSECOND);
+      } else {
+        if (p_interleave < 6 * GST_SECOND)
+          estimated_max_time = 6 * GST_SECOND;
+        else
+          estimated_max_time = p_interleave + (250 * GST_MSECOND);
+      }
+
+      if (overrun_max_time != GST_CLOCK_TIME_NONE
+          && estimated_max_time <= overrun_max_time) {
+        GST_FIXME_OBJECT (mq, "[Preroll] Plus bumping range + 250ms");
+        estimated_max_time = overrun_max_time + (250 * GST_MSECOND);
+      }
+    }
+  } else if (overrun_stream_types != GST_STREAM_TYPE_UNKNOWN
+      && underrun_stream_types != GST_STREAM_TYPE_UNKNOWN
+      && ((overrun_stream_types | underrun_stream_types) >=
+          (GST_STREAM_TYPE_VIDEO | GST_STREAM_TYPE_AUDIO))) {
+    /* bumping case in PAUSED/PLAYING state */
+    if (is_overrun_time) {
+      GstClockTime bumping_range = GST_CLOCK_STIME_NONE;
+      /* FIXME, Estimate bumping max-size-time */
+      if (mq->interleave >= (5 * GST_SECOND))
+        bumping_range = 2.5 * GST_SECOND;
+      else
+        bumping_range = 250 * GST_MSECOND;
+
+      estimated_max_time = overrun_max_time + bumping_range;
+
+      GST_FIXME_OBJECT (mq,
+          "Needs bumping up!!, bumping_range:%" GST_STIME_FORMAT,
+          GST_STIME_ARGS (bumping_range));
+    }
+
+    need_bumping = TRUE;
+  }
+
+  if (!need_bumping && serialized && (is_overrun_time || is_overrun_bytes)) {
+    if (is_overrun_time) {
+      GstClockTime bumping_range = GST_CLOCK_STIME_NONE;
+      /* FIXME, Estimate bumping max-size-time */
+      if (mq->interleave >= (5 * GST_SECOND))
+        bumping_range = 2.5 * GST_SECOND;
+      else
+        bumping_range = 250 * GST_MSECOND;
+
+      estimated_max_time = overrun_max_time + bumping_range;
+
+      GST_FIXME_OBJECT (mq,
+          "Needs bumping up in serialized event!!, bumping_range:%"
+          GST_STIME_FORMAT, GST_STIME_ARGS (bumping_range));
+    }
+
+    need_bumping = TRUE;
+  }
+
+  /* FIXME, Bumping max-size-time or bytes */
+  if (need_bumping) {
+    if (estimated_max_time != GST_CLOCK_TIME_NONE) {
+      mq->interleave = estimated_max_time;
+      mq->max_size.time = mq->interleave;
+      SET_CHILD_PROPERTY (mq, time);
+      GST_FIXME_OBJECT (mq,
+          "%s Bumping up interleave size to %" GST_STIME_FORMAT,
+          (is_preroll ? "[Prerolling]" : ""), GST_STIME_ARGS (mq->interleave));
+    }
+
+    if (is_overrun_bytes) {
+      mq->max_size.bytes = overrun_max_bytes + (0.5 * 1024 * 1024);
+      GST_FIXME_OBJECT (mq, "%s Bumping up max-size-bytes to %d",
+          (is_preroll ? "[Prerolling]" : ""), mq->max_size.bytes);
+      SET_CHILD_PROPERTY (mq, bytes);
+    }
+  }
+
+  return need_bumping;
 }
 
 static void
@@ -1301,7 +1964,11 @@ calculate_interleave (GstMultiQueue * mq, GstSingleQueue * sq)
     if (!oq->active) {
       GST_LOG_OBJECT (mq,
           "queue %d is not active yet, forcing interleave to 5s", oq->id);
-      mq->interleave = 5 * GST_SECOND;
+      /* FIXME: In case of streaming (such as DLNA) with badly interleaved file,
+       * we need to cache buffers until all linked pads get buffer as much as
+       * multiqueue can. */
+      //mq->interleave = 5 * GST_SECOND;
+      mq->interleave = GST_CLOCK_TIME_NONE;
       /* Update max-size time */
       mq->max_size.time = mq->interleave;
       SET_CHILD_PROPERTY (mq, time);
@@ -1326,6 +1993,19 @@ calculate_interleave (GstMultiQueue * mq, GstSingleQueue * sq)
         " high:%" GST_STIME_FORMAT, oq->id,
         GST_STIME_ARGS (oq->cached_sinktime), GST_STIME_ARGS (low),
         GST_STIME_ARGS (high));
+  }
+
+  if (gst_multi_queue_bumping (mq, FALSE)) {
+    GST_FIXME_OBJECT (mq, "%s Bumping up interleave size to %" GST_STIME_FORMAT,
+        (mq->is_preroll ? "[Prerolling]" : ""),
+        GST_STIME_ARGS (mq->interleave));
+    goto beach;
+  }
+
+  if (mq->is_preroll && mq->nb_preroll_bumping > 0) {
+    GST_LOG_OBJECT (mq,
+        "Doing bumping... No calcaulating for interleave size until prerolled");
+    goto beach;
   }
 
   if (GST_CLOCK_STIME_IS_VALID (low) && GST_CLOCK_STIME_IS_VALID (high)) {
@@ -2252,6 +2932,7 @@ gst_multi_queue_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
   switch (type) {
     case GST_EVENT_STREAM_START:
     {
+      GstStream *stream = NULL;
       if (mq->sync_by_running_time) {
         GstStreamFlags stream_flags;
         gst_event_parse_stream_flags (event, &stream_flags);
@@ -2261,10 +2942,13 @@ gst_multi_queue_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
         }
       }
 
-      sq->thread = g_thread_self ();
+      gst_event_parse_stream (event, &stream);
+      if (stream)
+        sq->stream_type = gst_stream_get_stream_type (stream);
 
       /* Remove EOS flag */
       sq->is_eos = FALSE;
+      sq->is_drained = FALSE;
       break;
     }
     case GST_EVENT_FLUSH_START:
@@ -2312,7 +2996,14 @@ gst_multi_queue_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
         }
       }
       break;
-
+    case GST_EVENT_CAPS:
+      if (sq->stream_type == GST_STREAM_TYPE_UNKNOWN) {
+        GstCaps *caps = NULL;
+        gst_event_parse_caps (event, &caps);
+        if (caps)
+          sq->stream_type = guess_stream_type_from_caps (caps);
+      }
+      break;
     default:
       if (!(GST_EVENT_IS_SERIALIZED (event))) {
         res = gst_pad_push_event (sq->srcpad, event);
@@ -2330,12 +3021,34 @@ gst_multi_queue_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
 
   item = gst_multi_queue_mo_item_new ((GstMiniObject *) event, curid);
 
+  GST_MULTI_QUEUE_MUTEX_LOCK (mq);
+  if (mq->use_interleave && mq->interleave_by_serialized_event) {
+    if (mq->max_size.bytes > DEFAULT_MAX_SIZE_BYTES) {
+      mq->max_size.bytes = DEFAULT_MAX_SIZE_BYTES;
+      GST_DEBUG_OBJECT (mq,
+          "SingleQueue %d : Recovering default max-size-bytes(%d)", sq->id,
+          mq->max_size.bytes);
+      SET_CHILD_PROPERTY (mq, bytes);
+    }
+
+    GST_DEBUG_OBJECT (mq, "SingleQueue %d : Checking overrun in event(%s)",
+        sq->id, GST_EVENT_TYPE_NAME (event));
+    if (gst_multi_queue_bumping (mq, TRUE))
+      GST_DEBUG_OBJECT (mq, "SingleQueue %d : Bumped max-size in event(%s)",
+          sq->id, GST_EVENT_TYPE_NAME (event));
+  }
+  GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
+
   GST_DEBUG_OBJECT (mq,
       "SingleQueue %d : Enqueuing event %p of type %s with id %d",
       sq->id, event, GST_EVENT_TYPE_NAME (event), curid);
 
   if (!gst_data_queue_push (sq->queue, (GstDataQueueItem *) item))
     goto flushing;
+
+  GST_LOG_OBJECT (mq,
+      "SingleQueue %d : Enqueued event %p of type %s with id %d", sq->id, event,
+      GST_EVENT_TYPE_NAME (event), curid);
 
   /* mark EOS when we received one, we must do that after putting the
    * buffer in the queue because EOS marks the buffer as filled. */
@@ -2347,6 +3060,17 @@ gst_multi_queue_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
       GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
       single_queue_overrun_cb (sq->queue, sq);
       gst_multi_queue_post_buffering (mq);
+      break;
+    case GST_EVENT_CUSTOM_DOWNSTREAM:
+      if (gst_event_has_name (event, "decodebin3-custom-eos")) {
+        GST_MULTI_QUEUE_MUTEX_LOCK (mq);
+        sq->is_drained = TRUE;
+
+        update_buffering (mq, sq);
+        GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
+        single_queue_overrun_cb (sq->queue, sq);
+        gst_multi_queue_post_buffering (mq);
+      }
       break;
     case GST_EVENT_EOS:
       GST_MULTI_QUEUE_MUTEX_LOCK (mq);
@@ -2739,9 +3463,6 @@ compute_high_time (GstMultiQueue * mq, guint groupid)
   }
 }
 
-#define IS_FILLED(q, format, value) (((q)->max_size.format) != 0 && \
-     ((q)->max_size.format) <= (value))
-
 /*
  * GstSingleQueue functions
  */
@@ -2806,6 +3527,12 @@ single_queue_overrun_cb (GstDataQueue * dq, GstSingleQueue * sq)
 done:
   GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
 
+  if (filled && mq->use_interleave) {
+    GST_MULTI_QUEUE_MUTEX_LOCK (mq);
+    gst_multi_queue_bumping (mq, FALSE);
+    GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
+  }
+
   /* Overrun is always forwarded, since this is blocking the upstream element */
   if (filled) {
     GST_DEBUG_OBJECT (mq, "Queue %d is filled, signalling overrun", sq->id);
@@ -2826,6 +3553,11 @@ single_queue_underrun_cb (GstDataQueue * dq, GstSingleQueue * sq)
   } else {
     GST_LOG_OBJECT (mq,
         "Single Queue %d is empty, Checking other single queues", sq->id);
+    if (mq->use_interleave) {
+      GST_MULTI_QUEUE_MUTEX_LOCK (mq);
+      gst_multi_queue_bumping (mq, FALSE);
+      GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
+    }
   }
 
   GST_MULTI_QUEUE_MUTEX_LOCK (mq);
@@ -2997,6 +3729,10 @@ gst_single_queue_new (GstMultiQueue * mqueue, guint id)
   sq->extra_size.bytes = mqueue->extra_size.bytes;
   sq->extra_size.time = mqueue->extra_size.time;
 
+  sq->base_buffering_size.visible = mqueue->base_buffering_size.visible;
+  sq->base_buffering_size.bytes = mqueue->base_buffering_size.bytes;
+  sq->base_buffering_size.time = mqueue->base_buffering_size.time;
+
   GST_DEBUG_OBJECT (mqueue, "Creating GstSingleQueue id:%d", sq->id);
 
   sq->mqueue = mqueue;
@@ -3007,6 +3743,7 @@ gst_single_queue_new (GstMultiQueue * mqueue, guint id)
       (GstDataQueueFullCallback) single_queue_overrun_cb,
       (GstDataQueueEmptyCallback) single_queue_underrun_cb, sq);
   sq->is_eos = FALSE;
+  sq->is_drained = FALSE;
   sq->is_sparse = FALSE;
   sq->flushing = FALSE;
   sq->active = FALSE;

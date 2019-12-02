@@ -5,7 +5,7 @@ GstCheckABIStruct list[] = {
   {"GstBaseSinkClass", sizeof (GstBaseSinkClass), 792},
   {"GstBaseSink", sizeof (GstBaseSink), 664},
   {"GstBaseSrcClass", sizeof (GstBaseSrcClass), 800},
-  {"GstBaseSrc", sizeof (GstBaseSrc), 648},
+  {"GstBaseSrc", sizeof (GstBaseSrc), 664},
   {"GstBaseTransformClass", sizeof (GstBaseTransformClass), 816},
   {"GstBaseTransform", sizeof (GstBaseTransform), 576},
   {"GstBitReader", sizeof (GstBitReader), 56},
@@ -33,7 +33,7 @@ GstCheckABIStruct list[] = {
   {"GstNetTimeProviderClass", sizeof (GstNetTimeProviderClass), 216},
   {"GstNetTimeProvider", sizeof (GstNetTimeProvider), 128},
   {"GstPushSrcClass", sizeof (GstPushSrcClass), 856},
-  {"GstPushSrc", sizeof (GstPushSrc), 680},
+  {"GstPushSrc", sizeof (GstPushSrc), 696},
   {"GstTimedValue", sizeof (GstTimedValue), 16},
   {NULL, 0, 0}
 };

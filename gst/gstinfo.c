@@ -345,6 +345,41 @@ _priv_gst_debug_file_name (const gchar * env)
   return name;
 }
 
+static void
+gst_log_file_name (const gchar * env, gchar * buf, size_t bufsize)
+{
+  int max = 0;
+  int seq = 0;
+  FILE *f;
+
+  const gchar *max_count = g_getenv ("GST_DEBUG_FILE_MAX_COUNT");
+  if (max_count != NULL && *max_count != '\0') {
+    max = strtol (max_count, NULL, 10);
+  }
+
+  if (max < 2) {
+    g_snprintf (buf, bufsize, "%s", env);
+    return;
+  }
+
+  g_snprintf (buf, bufsize, "%s.seq", env);
+  f = g_fopen (buf, "r+");
+  if (f) {
+    if (fscanf (f, "%d", &seq) == 1)
+      seq = (seq + 1) % max;
+    fseek (f, 0, SEEK_SET);
+  } else {
+    f = g_fopen (buf, "w");
+  }
+
+  if (f) {
+    fprintf (f, "%d", seq);
+    fclose (f);
+  }
+
+  g_snprintf (buf, bufsize, "%s.%d", env, seq);
+}
+
 /* Initialize the debugging system */
 void
 _priv_gst_debug_init (void)
@@ -358,9 +393,16 @@ _priv_gst_debug_init (void)
       if (strcmp (env, "-") == 0) {
         log_file = stdout;
       } else {
-        gchar *name = _priv_gst_debug_file_name (env);
-        log_file = g_fopen (name, "w");
-        g_free (name);
+        const gchar *max_count = g_getenv ("GST_DEBUG_FILE_MAX_COUNT");
+        if (max_count != NULL && *max_count != '\0') {
+          gchar filename[128];
+          gst_log_file_name (env, filename, sizeof (filename));
+          log_file = g_fopen (filename, "w");
+        } else {
+          gchar *name = _priv_gst_debug_file_name (env);
+          log_file = g_fopen (name, "w");
+          g_free (name);
+        }
         if (log_file == NULL) {
           g_printerr ("Could not open log file '%s' for writing: %s\n", env,
               g_strerror (errno));

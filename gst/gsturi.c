@@ -679,7 +679,7 @@ gst_element_make_from_uri (const GstURIType type, const gchar * uri,
   }
   gst_plugin_feature_list_free (possibilities);
 
-  GST_LOG_OBJECT (ret, "created %s for URL '%s'",
+  GST_SYS_LOG_OBJECT (ret, "created %s for URL '%s'",
       type == GST_URI_SINK ? "sink" : "source", uri);
 
   /* if the first handler didn't work, but we found another one that works */

@@ -134,6 +134,7 @@ typedef guint64 GstElementFactoryListType;
 #define  GST_ELEMENT_FACTORY_TYPE_FORMATTER      ((GstElementFactoryListType)(G_GUINT64_CONSTANT (1) << 9))
 #define  GST_ELEMENT_FACTORY_TYPE_DECRYPTOR      ((GstElementFactoryListType)(G_GUINT64_CONSTANT (1) << 10))
 #define  GST_ELEMENT_FACTORY_TYPE_ENCRYPTOR      ((GstElementFactoryListType)(G_GUINT64_CONSTANT (1) << 11))
+#define  GST_ELEMENT_FACTORY_TYPE_COMBINER       ((GstElementFactoryListType)(G_GUINT64_CONSTANT (1) << 12))
 
 #define  GST_ELEMENT_FACTORY_TYPE_MAX_ELEMENTS   ((GstElementFactoryListType)(G_GUINT64_CONSTANT (1) << 48))
 
@@ -203,6 +204,7 @@ typedef guint64 GstElementFactoryListType;
 #define GST_ELEMENT_FACTORY_KLASS_FORMATTER             "Formatter"
 #define GST_ELEMENT_FACTORY_KLASS_DECRYPTOR             "Decryptor"
 #define GST_ELEMENT_FACTORY_KLASS_ENCRYPTOR             "Encryptor"
+#define GST_ELEMENT_FACTORY_KLASS_COMBINER              "Combiner"
 
 #define GST_ELEMENT_FACTORY_KLASS_MEDIA_VIDEO           "Video"
 #define GST_ELEMENT_FACTORY_KLASS_MEDIA_AUDIO           "Audio"

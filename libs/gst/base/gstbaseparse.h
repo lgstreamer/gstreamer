@@ -360,6 +360,18 @@ void            gst_base_parse_merge_tags       (GstBaseParse  * parse,
                                                  GstTagList    * tags,
                                                  GstTagMergeMode mode);
 
+GST_BASE_API
+void            gst_base_parse_set_next_timestamp (GstBaseParse * parse,
+                                                GstClockTime next_pts,
+                                                GstClockTime next_dts);
+
+GST_BASE_API
+void            gst_base_parse_set_seek_tolerance (GstBaseParse * parse,
+                                                GstClockTime seek_tolerance);
+
+GST_BASE_API
+void            gst_base_parse_set_skipped_frame (GstBaseParse * parse);
+
 #ifdef G_DEFINE_AUTOPTR_CLEANUP_FUNC
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(GstBaseParseFrame, gst_base_parse_frame_free)
 #endif

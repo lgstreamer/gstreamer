@@ -89,7 +89,17 @@ gst_push_src_class_init (GstPushSrcClass * klass)
 static void
 gst_push_src_init (GstPushSrc * pushsrc)
 {
-  /* nop */
+  GstBaseSrc *basesrc = GST_BASE_SRC_CAST (pushsrc);
+
+  if (!basesrc->smart_prop) {
+    GstStructure *s =
+        gst_structure_new ("smart-properties", "push-mode", G_TYPE_BOOLEAN,
+        TRUE, NULL);
+    basesrc->smart_prop = gst_structure_copy (s);
+    gst_structure_free (s);
+  } else
+    gst_structure_set (basesrc->smart_prop, "push-mode", G_TYPE_BOOLEAN, TRUE,
+        NULL);
 }
 
 static gboolean

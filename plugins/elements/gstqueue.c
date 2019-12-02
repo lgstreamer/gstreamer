@@ -119,6 +119,8 @@ enum
   PROP_MIN_THRESHOLD_BUFFERS,
   PROP_MIN_THRESHOLD_BYTES,
   PROP_MIN_THRESHOLD_TIME,
+  PROP_FIRST_TIMESTAMP,
+  PROP_LAST_TIMESTAMP,
   PROP_LEAKY,
   PROP_SILENT,
   PROP_FLUSH_ON_EOS
@@ -363,6 +365,17 @@ gst_queue_class_init (GstQueueClass * klass)
           G_PARAM_READWRITE | GST_PARAM_MUTABLE_PLAYING |
           G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_FIRST_TIMESTAMP,
+      g_param_spec_uint64 ("first-timestamp", "First timestamp (ns)",
+          "First timestamp of enqueued data in the queue (in ns)",
+          0, G_MAXUINT64, GST_CLOCK_TIME_NONE,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_LAST_TIMESTAMP,
+      g_param_spec_uint64 ("last-timestamp", "Last timestamp (ns)",
+          "Last timestamp of enqueued data in the queue (in ns)", 0,
+          G_MAXUINT64, GST_CLOCK_TIME_NONE,
+          G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
   g_object_class_install_property (gobject_class, PROP_LEAKY,
       g_param_spec_enum ("leaky", "Leaky",
           "Where the queue leaks, if at all",
@@ -468,6 +481,9 @@ gst_queue_init (GstQueue * queue)
 
   queue->sinktime = GST_CLOCK_STIME_NONE;
   queue->srctime = GST_CLOCK_STIME_NONE;
+
+  queue->first_timestamp = GST_CLOCK_TIME_NONE;
+  queue->last_timestamp = GST_CLOCK_TIME_NONE;
 
   queue->sink_tainted = TRUE;
   queue->src_tainted = TRUE;
@@ -694,6 +710,33 @@ apply_buffer_list (GstQueue * queue, GstBufferList * buffer_list,
   update_time_level (queue);
 }
 
+/* update the timestamp of enqueued buffer */
+static void
+update_enqueue_buffer_timestamp (GstQueue * queue, GstBuffer * buffer)
+{
+  GstClockTime timestamp;
+
+  timestamp = GST_BUFFER_TIMESTAMP (buffer);
+
+  if (timestamp != GST_CLOCK_TIME_NONE) {
+    queue->last_timestamp = timestamp;
+
+    if (queue->first_timestamp == GST_CLOCK_TIME_NONE)
+      queue->first_timestamp = timestamp;
+  }
+}
+
+/* update the timestamp of enqueued buffer list */
+static gboolean
+update_enqueue_buffer_list_timestamp (GstBuffer ** buf, guint idx,
+    gpointer user_data)
+{
+  GstQueue *queue = user_data;
+  update_enqueue_buffer_timestamp (queue, *buf);
+
+  return TRUE;
+}
+
 static void
 gst_queue_locked_flush (GstQueue * queue, gboolean full)
 {
@@ -741,6 +784,7 @@ gst_queue_locked_enqueue_buffer (GstQueue * queue, gpointer item)
   queue->cur_level.buffers++;
   queue->cur_level.bytes += bsize;
   apply_buffer (queue, buffer, &queue->sink_segment, TRUE);
+  update_enqueue_buffer_timestamp (queue, buffer);
 
   qitem.item = item;
   qitem.is_query = FALSE;
@@ -762,6 +806,8 @@ gst_queue_locked_enqueue_buffer_list (GstQueue * queue, gpointer item)
   queue->cur_level.buffers += gst_buffer_list_length (buffer_list);
   queue->cur_level.bytes += bsize;
   apply_buffer_list (queue, buffer_list, &queue->sink_segment, TRUE);
+  gst_buffer_list_foreach (buffer_list, update_enqueue_buffer_list_timestamp,
+      queue);
 
   qitem.item = item;
   qitem.is_query = FALSE;
@@ -949,6 +995,7 @@ gst_queue_handle_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
       queue->srcresult = GST_FLOW_OK;
       queue->eos = FALSE;
       queue->unexpected = FALSE;
+      queue->last_timestamp = GST_CLOCK_TIME_NONE;
       if (gst_pad_is_active (queue->srcpad)) {
         gst_pad_start_task (queue->srcpad, (GstTaskFunction) gst_queue_loop,
             queue->srcpad, NULL);
@@ -1883,6 +1930,12 @@ gst_queue_get_property (GObject * object,
       break;
     case PROP_MIN_THRESHOLD_TIME:
       g_value_set_uint64 (value, queue->min_threshold.time);
+      break;
+    case PROP_FIRST_TIMESTAMP:
+      g_value_set_uint64 (value, queue->first_timestamp);
+      break;
+    case PROP_LAST_TIMESTAMP:
+      g_value_set_uint64 (value, queue->last_timestamp);
       break;
     case PROP_LEAKY:
       g_value_set_enum (value, queue->leaky);

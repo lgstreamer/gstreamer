@@ -105,9 +105,6 @@ enum
   PROP_LATENCY
 };
 
-#define GST_PIPELINE_GET_PRIVATE(obj)  \
-   (G_TYPE_INSTANCE_GET_PRIVATE ((obj), GST_TYPE_PIPELINE, GstPipelinePrivate))
-
 struct _GstPipelinePrivate
 {
   /* with LOCK */
@@ -144,7 +141,8 @@ static gboolean gst_pipeline_do_latency (GstBin * bin);
 }
 
 #define gst_pipeline_parent_class parent_class
-G_DEFINE_TYPE_WITH_CODE (GstPipeline, gst_pipeline, GST_TYPE_BIN, _do_init);
+G_DEFINE_TYPE_WITH_CODE (GstPipeline, gst_pipeline, GST_TYPE_BIN,
+    G_ADD_PRIVATE (GstPipeline) _do_init);
 
 static void
 gst_pipeline_class_init (GstPipelineClass * klass)
@@ -152,8 +150,6 @@ gst_pipeline_class_init (GstPipelineClass * klass)
   GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
   GstElementClass *gstelement_class = GST_ELEMENT_CLASS (klass);
   GstBinClass *gstbin_class = GST_BIN_CLASS (klass);
-
-  g_type_class_add_private (klass, sizeof (GstPipelinePrivate));
 
   gobject_class->set_property = gst_pipeline_set_property;
   gobject_class->get_property = gst_pipeline_get_property;
@@ -217,7 +213,7 @@ gst_pipeline_init (GstPipeline * pipeline)
 {
   GstBus *bus;
 
-  pipeline->priv = GST_PIPELINE_GET_PRIVATE (pipeline);
+  pipeline->priv = gst_pipeline_get_instance_private (pipeline);
 
   /* set default property values */
   pipeline->priv->auto_flush_bus = DEFAULT_AUTO_FLUSH_BUS;
@@ -312,6 +308,13 @@ reset_start_time (GstPipeline * pipeline, GstClockTime start_time)
   GST_OBJECT_UNLOCK (pipeline);
 }
 
+void
+gst_pipeline_reset_start_time (GstPipeline * pipeline, GstClockTime start_time)
+{
+  GST_DEBUG_OBJECT (pipeline, "Reset start_time to 0");
+  reset_start_time (pipeline, start_time);
+}
+
 /**
  * gst_pipeline_new:
  * @name: (allow-none): name of new pipeline
@@ -370,6 +373,152 @@ pipeline_update_start_time (GstElement * element)
         GST_TIME_ARGS (now), GST_TIME_ARGS (element->base_time));
   }
   GST_OBJECT_UNLOCK (element);
+}
+
+GstClockTime
+gst_pipeline_get_base_time (GstPipeline * pipeline, GstClockTime stime)
+{
+  GstElement *element = GST_ELEMENT_CAST (pipeline);
+  GstClock *clock;
+  GstClockTime now, start_time, delay;
+  GstClock *cur_clock;
+  GstClockTime new_base_time = GST_CLOCK_TIME_NONE;
+
+  GST_DEBUG_OBJECT (element, "Obtaining new base_time");
+
+  GST_OBJECT_LOCK (element);
+  cur_clock = element->clock;
+  if (cur_clock)
+    gst_object_ref (cur_clock);
+  /* get the desired running_time of the first buffer aka the start_time */
+  if (stime == GST_CLOCK_TIME_NONE)
+    start_time = GST_ELEMENT_START_TIME (pipeline);
+  else
+    start_time = stime;
+
+  /* see if we need to update the clock */
+  delay = pipeline->delay;
+  GST_OBJECT_UNLOCK (element);
+
+  if (cur_clock)
+    gst_object_ref (cur_clock);
+  clock = cur_clock;
+
+  if (clock) {
+    now = gst_clock_get_time (clock);
+  } else {
+    GST_DEBUG_OBJECT (pipeline, "no clock, using base time of NONE");
+    now = GST_CLOCK_TIME_NONE;
+  }
+
+  if (clock)
+    gst_object_unref (clock);
+
+  if (start_time != GST_CLOCK_TIME_NONE && now != GST_CLOCK_TIME_NONE) {
+    new_base_time = now - start_time + delay;
+    GST_DEBUG_OBJECT (element,
+        "start_time=%" GST_TIME_FORMAT ", now=%" GST_TIME_FORMAT
+        ", base_time %" GST_TIME_FORMAT,
+        GST_TIME_ARGS (start_time), GST_TIME_ARGS (now),
+        GST_TIME_ARGS (new_base_time));
+
+  } else {
+    GST_DEBUG_OBJECT (pipeline,
+        "NOT obtaining base_time because start_time is NONE");
+  }
+
+  if (cur_clock)
+    gst_object_unref (cur_clock);
+
+  return new_base_time;
+}
+
+gboolean
+gst_pipeline_update_base_time (GstPipeline * pipeline, GstClockTime btime)
+{
+  GstElement *element = GST_ELEMENT_CAST (pipeline);
+  GstClock *clock;
+  GstClockTime now, start_time, delay;
+  GstClock *cur_clock;
+
+  GST_DEBUG_OBJECT (element, "selecting clock and base_time %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (btime));
+
+  GST_OBJECT_LOCK (element);
+  cur_clock = element->clock;
+  if (cur_clock)
+    gst_object_ref (cur_clock);
+  /* get the desired running_time of the first buffer aka the start_time */
+  start_time = GST_ELEMENT_START_TIME (pipeline);
+  pipeline->priv->last_start_time = start_time;
+  delay = pipeline->delay;
+  GST_OBJECT_UNLOCK (element);
+
+  GST_DEBUG_OBJECT (element, "start_time: %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (start_time));
+
+  GST_DEBUG_OBJECT (pipeline, "Don't need to update clock, using old clock.");
+  /* only try to ref if cur_clock is not NULL */
+  if (cur_clock)
+    gst_object_ref (cur_clock);
+  clock = cur_clock;
+
+  if (clock) {
+    now = gst_clock_get_time (clock);
+  } else {
+    GST_DEBUG_OBJECT (pipeline, "no clock, using base time of NONE");
+    now = GST_CLOCK_TIME_NONE;
+  }
+
+  if (clock != cur_clock) {
+    /* now distribute the clock (which could be NULL). If some
+     * element refuses the clock, this will return FALSE and
+     * we effectively fail the state change. */
+    if (!gst_element_set_clock (element, clock))
+      goto invalid_clock;
+
+    /* if we selected and distributed a new clock, let the app
+     * know about it */
+    gst_element_post_message (element,
+        gst_message_new_new_clock (GST_OBJECT_CAST (element), clock));
+  }
+
+  if (clock)
+    gst_object_unref (clock);
+
+  if (start_time != GST_CLOCK_TIME_NONE && now != GST_CLOCK_TIME_NONE) {
+    GstClockTime new_base_time =
+        (btime != GST_CLOCK_TIME_NONE) ? btime : (now - start_time + delay);
+    GST_DEBUG_OBJECT (element,
+        "start_time=%" GST_TIME_FORMAT ", now=%" GST_TIME_FORMAT
+        ", base_time %" GST_TIME_FORMAT, GST_TIME_ARGS (start_time),
+        GST_TIME_ARGS (now), GST_TIME_ARGS (new_base_time));
+
+    gst_element_set_base_time (element, new_base_time);
+  } else {
+    GST_DEBUG_OBJECT (pipeline,
+        "NOT adjusting base_time because start_time is NONE");
+  }
+
+  if (cur_clock)
+    gst_object_unref (cur_clock);
+
+  return TRUE;
+
+  /* ERRORS */
+invalid_clock:
+  {
+    /* we generate this error when the selected clock was not
+     * accepted by some element */
+    GST_ELEMENT_ERROR (pipeline, CORE, CLOCK,
+        (_("Selected clock cannot be used in pipeline.")),
+        ("Pipeline cannot operate with selected clock"));
+    GST_DEBUG_OBJECT (pipeline,
+        "Pipeline cannot operate with selected clock %p", clock);
+    if (clock)
+      gst_object_unref (clock);
+    return FALSE;
+  }
 }
 
 /* MT safe */

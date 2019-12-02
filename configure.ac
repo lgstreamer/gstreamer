@@ -253,6 +253,23 @@ if test "x$USE_POISONING" = xyes; then
     [Define if we should poison deallocated memory])
 fi
 
+dnl option for system log
+AC_ARG_ENABLE(system-log,
+  AS_HELP_STRING([--enable-system-log],[enable system log]),
+  [
+    case "${enableval}" in
+      yes) DUMP_SYSLOG=yes ;;
+      no)  DUMP_SYSLOG=no ;;
+      *)   AC_MSG_ERROR(bad value ${enableval} for --enable-system-log) ;;
+    esac
+  ],
+  [DUMP_SYSLOG=no]) dnl Default value
+if test "x$DUMP_SYSLOG" = xyes; then
+  AC_DEFINE(DUMP_SYSLOG, 1,
+    [Define if we need system log])
+fi
+
+
 dnl PTP support parts
 AC_MSG_CHECKING([whether PTP support can be enabled])
 case "$host_os" in
@@ -890,6 +907,11 @@ AC_ARG_WITH([memory-alignment],
   ]
 )
 
+dnl Symbol visibility
+VISIBILITY_CFLAGS=""
+AS_COMPILER_FLAG([-fvisibility=hidden], [VISIBILITY_CFLAGS="-fvisibility=hidden"])
+AC_SUBST(VISIBILITY_CFLAGS)
+
 dnl Check for -Bsymbolic-functions linker flag used to avoid
 dnl intra-library PLT jumps, if available.
 AC_ARG_ENABLE(Bsymbolic,
@@ -987,7 +1009,7 @@ dnl   will need the GStreamer source and generated headers
 dnl LIBS: XML doesn't need to be added because we don't explicitly use symbols
 dnl       from LibXML except for in the core library
 GST_ALL_CXXFLAGS="-I\$(top_srcdir)/libs -I\$(top_srcdir) -I\$(top_builddir)/libs -I\$(top_builddir) $GLIB_CFLAGS \$(GLIB_EXTRA_CFLAGS) $EXTRA_CFLAGS \$(GST_OPTION_CXXFLAGS) \$(ERROR_CXXFLAGS)"
-GST_ALL_CFLAGS="-I\$(top_srcdir)/libs -I\$(top_srcdir) -I\$(top_builddir)/libs -I\$(top_builddir) $GLIB_CFLAGS \$(GLIB_EXTRA_CFLAGS) $EXTRA_CFLAGS \$(GST_OPTION_CFLAGS) \$(ERROR_CFLAGS)"
+GST_ALL_CFLAGS="-I\$(top_srcdir)/libs -I\$(top_srcdir) -I\$(top_builddir)/libs -I\$(top_builddir) $GLIB_CFLAGS \$(GLIB_EXTRA_CFLAGS) $EXTRA_CFLAGS \$(GST_OPTION_CFLAGS) \$(ERROR_CFLAGS) \$(VISIBILITY_CFLAGS)"
 
 dnl FIXME: check if LTLIBINTL is needed everywhere
 dnl I presume it is given that it contains the symbols that _() stuff maps to
@@ -1008,7 +1030,7 @@ AC_SUBST(GST_ALL_LDFLAGS)
 dnl GST_LIB_LDFLAGS
 dnl linker flags shared by all libraries
 dnl LDFLAGS modifier defining exported symbols from built libraries
-GST_LIB_LDFLAGS="-export-symbols-regex \^[_]?\(gst_\|Gst\|GST_\).*"
+GST_LIB_LDFLAGS=""
 AC_SUBST(GST_LIB_LDFLAGS)
 
 dnl GST_OBJ_*
@@ -1023,7 +1045,7 @@ AC_SUBST(GST_OBJ_LIBS)
 
 dnl GST_PLUGIN_LDFLAGS
 dnl LDFLAGS for plugins; includes GST_ALL_LDFLAGS
-GST_PLUGIN_LDFLAGS="-module -avoid-version -export-symbols-regex '^[_]*gst_plugin_.*' $GST_ALL_LDFLAGS"
+GST_PLUGIN_LDFLAGS="-module -avoid-version $GST_ALL_LDFLAGS"
 AC_SUBST(GST_PLUGIN_LDFLAGS, "$GST_PLUGIN_LDFLAGS")
 
 dnl plugin scanner locations

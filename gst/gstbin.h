@@ -250,6 +250,13 @@ void            gst_bin_set_suppressed_flags (GstBin * bin, GstElementFlags flag
 GST_API
 GstElementFlags gst_bin_get_suppressed_flags (GstBin * bin);
 
+/* notify state change failur */
+typedef void (*GstBinStateFailureNotifyFunc)     (GstBin * bin,
+                                                  GstElement *element);
+
+GST_API
+gboolean gst_bin_set_state_failure_notify (GstBin *bin, gpointer func);
+
 #ifdef G_DEFINE_AUTOPTR_CLEANUP_FUNC
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(GstBin, gst_object_unref)
 #endif

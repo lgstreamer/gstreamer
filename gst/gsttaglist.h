@@ -885,6 +885,92 @@ gst_tag_list_copy (const GstTagList * taglist)
  */
 #define GST_TAG_LANGUAGE_NAME          "language-name"
 /**
+ * GST_TAG_AUDIO_DESCRIPTION:
+ *
+ * Name of descriptors category for the audio is in (string)
+ *
+ * The tag identifies the type of audio description for audio components.
+ */
+#define GST_TAG_AUDIO_DESCRIPTION      "role"
+/**
+ * GST_TAG_PID:
+ *
+ * Subtitle pid for the subtitle content is in (guint16)
+ *
+ * The subtitle pid is used to find correct data for specific subtitle track.
+ * Single pid may contain 1 or multiple tracks. If there's multiple tracks
+ * for single pid, then composition-page-id and ancillary-page-id is needed
+ * to distinguish data for specific track.
+ */
+#define GST_TAG_PID                    "pid"
+/**
+ * GST_TAG_TRACK_ID:
+ *
+ * track_ID for uniquely identifies this track
+ */
+#define GST_TAG_TRACK_ID               "track-id"
+/**
+ * GST_TAG_COMPONENT_TAG:
+ *
+ * The tag identifies the component stream for associating it with a
+ * description given in a component descriptor
+ */
+#define GST_TAG_COMPONENT_TAG          "component-tag"
+/**
+ * GST_TAG_SUBTITLING_TYPE:
+ *
+ * Subtitle Type for the subtitle content is in (guint8)
+ *
+ * The subtitling descriptor shall be included in the PMT of the program and
+ * shall be associated to the PID that conveys the subtitle stream.
+ * subtitle type describe the subtitle type in the subtitle descriptor.
+ */
+#define GST_TAG_SUBTITLING_TYPE        "subtitling-type"
+/**
+ * GST_TAG_COMPOSITION_PAGE_ID:
+ *
+ * composition page id for the subtitle content is in (guint16)
+ *
+ * In the subtitling descriptor the page id of segments with data
+ * specific to that service is referred to as the composition page id
+ */
+#define GST_TAG_COMPOSITION_PAGE_ID    "composition-page-id"
+/**
+ * GST_TAG_ANCILLARY_PAGE_ID:
+ *
+ * ancillary page id for the subtitle content is in (guint16)
+ *
+ * The page id of segments with shared data in subtitle descriptor
+ * referred to as the ancillary page id
+ */
+#define GST_TAG_ANCILLARY_PAGE_ID      "ancillary-page-id"
+/**
+ * GST_TAG_TELETEXT_TYPE:
+ *
+ * teletext type for the teletext content is in (guint8)
+ *
+ * In the teletext descriptor the type of Teletext page indicated.
+ */
+#define GST_TAG_TELETEXT_TYPE          "teletext-type"
+/**
+ * GST_TAG_TELETEXT_MAGAZINE_NUMBER:
+ *
+ * teletext magazine number for the teletext content is in (guint8)
+ *
+ * The magazine number in teletext descriptor refferred to as the
+ * teletext magazine number
+ */
+#define GST_TAG_TELETEXT_MAGAZINE_NUMBER               "teletext-magazine-number"
+/**
+ *
+ * GST_TAG_TELETEXT_PAGE_NUMBER:
+ *
+ * teletext page number for the teletext content is in (guint8)
+ *
+ * In the teletext descriptor the number of page indicated.
+ */
+#define GST_TAG_TELETEXT_PAGE_NUMBER               "teletext-page-number"
+/**
  * GST_TAG_IMAGE:
  *
  * image (sample) (sample taglist should specify the content type and preferably

@@ -103,6 +103,8 @@ typedef enum {
  *                 event.
  * @GST_EVENT_SEGMENT_DONE: Marks the end of a segment playback.
  * @GST_EVENT_GAP: Marks a gap in the datastream.
+ * @GST_EVENT_STREAMS_SELECTED: Specifies the lists of individual streams that
+ *                 will be provided by upstream elements.
  * @GST_EVENT_TOC: An event which indicates that a new table of contents (TOC)
  *                 was found or updated.
  * @GST_EVENT_PROTECTION: An event which indicates that new or updated
@@ -162,6 +164,9 @@ typedef enum {
   /* non-sticky downstream serialized */
   GST_EVENT_SEGMENT_DONE          = GST_EVENT_MAKE_TYPE (150, FLAG(DOWNSTREAM) | FLAG(SERIALIZED)),
   GST_EVENT_GAP                   = GST_EVENT_MAKE_TYPE (160, FLAG(DOWNSTREAM) | FLAG(SERIALIZED)),
+
+  /* sticky downstream non-serialized */
+  GST_EVENT_STREAMS_SELECTED      = GST_EVENT_MAKE_TYPE (170, FLAG(DOWNSTREAM) | FLAG(STICKY)),
 
   /* upstream events */
   GST_EVENT_QOS                   = GST_EVENT_MAKE_TYPE (190, FLAG(UPSTREAM)),
@@ -572,6 +577,24 @@ GST_API
 void            gst_event_parse_gap             (GstEvent     * event,
                                                  GstClockTime * timestamp,
                                                  GstClockTime * duration);
+
+/* STREAMS_SELECTED event */
+GST_API
+GstEvent *      gst_event_new_streams_selected  (GstStreamCollection * collection);
+
+GST_API
+void            gst_event_streams_selected_add  (GstEvent  * event,
+						 GstStream * stream);
+GST_API
+void            gst_event_parse_streams_selected (GstEvent * event,
+						  GstStreamCollection **collection);
+GST_API
+guint           gst_event_streams_selected_get_size (GstEvent * event);
+
+GST_API
+GstStream *     gst_event_streams_selected_get_stream (GstEvent *event,
+						       guint idx);
+
 
 /* Caps events */
 

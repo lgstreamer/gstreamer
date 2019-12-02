@@ -152,6 +152,25 @@ GstCaps *      gst_stream_get_caps (GstStream *stream);
 GST_API
 const gchar *  gst_stream_type_get_name (GstStreamType stype);
 
+GST_API
+void           gst_stream_add_component (GstStream *stream,
+					 GstStream *component);
+
+GST_API
+guint          gst_stream_get_components_size (GstStream *stream);
+
+GST_API
+GstStream *    gst_stream_get_component_idx (GstStream *stream,
+					     guint      idx);
+
+GST_API
+gboolean       gst_stream_has_component (GstStream *stream,
+					 GstStream *component);
+
+GST_API
+gboolean       gst_stream_has_component_by_name (GstStream *stream,
+						 const gchar *stream_id);
+
 #ifdef G_DEFINE_AUTOPTR_CLEANUP_FUNC
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(GstStream, gst_object_unref)
 #endif

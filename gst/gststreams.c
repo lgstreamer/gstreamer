@@ -55,15 +55,15 @@
 GST_DEBUG_CATEGORY_STATIC (streams_debug);
 #define GST_CAT_DEFAULT streams_debug
 
-#define GST_STREAM_GET_PRIVATE(obj)  \
-   (G_TYPE_INSTANCE_GET_PRIVATE ((obj), GST_TYPE_STREAM, GstStreamPrivate))
-
 struct _GstStreamPrivate
 {
   GstStreamFlags flags;
   GstStreamType type;
   GstTagList *tags;
   GstCaps *caps;
+
+  /* Components */
+  GQueue components;
 };
 
 /* stream signals and properties */
@@ -104,7 +104,8 @@ static void gst_stream_get_property (GObject * object, guint prop_id,
 }
 
 #define gst_stream_parent_class parent_class
-G_DEFINE_TYPE_WITH_CODE (GstStream, gst_stream, GST_TYPE_OBJECT, _do_init);
+G_DEFINE_TYPE_WITH_CODE (GstStream, gst_stream, GST_TYPE_OBJECT,
+    G_ADD_PRIVATE (GstStream) _do_init);
 
 static void
 gst_stream_class_init (GstStreamClass * klass)
@@ -112,8 +113,6 @@ gst_stream_class_init (GstStreamClass * klass)
   GObjectClass *gobject_class;
 
   gobject_class = (GObjectClass *) klass;
-
-  g_type_class_add_private (klass, sizeof (GstStreamPrivate));
 
   gobject_class->set_property = gst_stream_set_property;
   gobject_class->get_property = gst_stream_get_property;
@@ -182,8 +181,9 @@ gst_stream_class_init (GstStreamClass * klass)
 static void
 gst_stream_init (GstStream * stream)
 {
-  stream->priv = GST_STREAM_GET_PRIVATE (stream);
+  stream->priv = gst_stream_get_instance_private (stream);
   stream->priv->type = GST_STREAM_TYPE_UNKNOWN;
+  g_queue_init (&stream->priv->components);
 }
 
 static void
@@ -195,6 +195,9 @@ gst_stream_finalize (GObject * object)
       (GstMiniObject *) NULL);
   gst_caps_replace (&stream->priv->caps, NULL);
   g_free ((gchar *) stream->stream_id);
+
+  g_queue_foreach (&stream->priv->components, (GFunc) gst_object_unref, NULL);
+  g_queue_clear (&stream->priv->components);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -223,6 +226,8 @@ gst_stream_new (const gchar * stream_id, GstCaps * caps, GstStreamType type,
   stream = g_object_new (GST_TYPE_STREAM, "stream-id", stream_id, "caps", caps,
       "stream-type", type, "stream-flags", flags, NULL);
 
+  gst_object_set_name ((GstObject *) stream, stream->stream_id);
+
   /* Clear floating flag */
   gst_object_ref_sink (stream);
 
@@ -232,6 +237,8 @@ gst_stream_new (const gchar * stream_id, GstCaps * caps, GstStreamType type,
 static void
 gst_stream_set_stream_id (GstStream * stream, const gchar * stream_id)
 {
+  g_return_if_fail (GST_IS_STREAM (stream));
+
   GST_OBJECT_LOCK (stream);
   g_assert (stream->stream_id == NULL);
   if (stream_id)
@@ -262,6 +269,8 @@ gst_stream_set_stream_id (GstStream * stream, const gchar * stream_id)
 const gchar *
 gst_stream_get_stream_id (GstStream * stream)
 {
+  g_return_val_if_fail (GST_IS_STREAM (stream), NULL);
+
   return stream->stream_id;
 }
 
@@ -277,6 +286,8 @@ gst_stream_get_stream_id (GstStream * stream)
 void
 gst_stream_set_stream_flags (GstStream * stream, GstStreamFlags flags)
 {
+  g_return_if_fail (GST_IS_STREAM (stream));
+
   GST_OBJECT_LOCK (stream);
   stream->priv->flags = flags;
   GST_OBJECT_UNLOCK (stream);
@@ -300,6 +311,8 @@ gst_stream_get_stream_flags (GstStream * stream)
 {
   GstStreamFlags res;
 
+  g_return_val_if_fail (GST_IS_STREAM (stream), GST_STREAM_FLAG_NONE);
+
   GST_OBJECT_LOCK (stream);
   res = stream->priv->flags;
   GST_OBJECT_UNLOCK (stream);
@@ -319,6 +332,8 @@ gst_stream_get_stream_flags (GstStream * stream)
 void
 gst_stream_set_stream_type (GstStream * stream, GstStreamType stream_type)
 {
+  g_return_if_fail (GST_IS_STREAM (stream));
+
   GST_OBJECT_LOCK (stream);
   stream->priv->type = stream_type;
   GST_OBJECT_UNLOCK (stream);
@@ -342,6 +357,8 @@ gst_stream_get_stream_type (GstStream * stream)
 {
   GstStreamType res;
 
+  g_return_val_if_fail (GST_IS_STREAM (stream), GST_STREAM_TYPE_UNKNOWN);
+
   GST_OBJECT_LOCK (stream);
   res = stream->priv->type;
   GST_OBJECT_UNLOCK (stream);
@@ -362,6 +379,8 @@ void
 gst_stream_set_tags (GstStream * stream, GstTagList * tags)
 {
   gboolean notify = FALSE;
+
+  g_return_if_fail (GST_IS_STREAM (stream));
 
   GST_OBJECT_LOCK (stream);
   if (stream->priv->tags == NULL || tags == NULL
@@ -391,6 +410,8 @@ gst_stream_get_tags (GstStream * stream)
 {
   GstTagList *res = NULL;
 
+  g_return_val_if_fail (GST_IS_STREAM (stream), NULL);
+
   GST_OBJECT_LOCK (stream);
   if (stream->priv->tags)
     res = gst_tag_list_ref (stream->priv->tags);
@@ -412,6 +433,8 @@ void
 gst_stream_set_caps (GstStream * stream, GstCaps * caps)
 {
   gboolean notify = FALSE;
+
+  g_return_if_fail (GST_IS_STREAM (stream));
 
   GST_OBJECT_LOCK (stream);
   if (stream->priv->caps == NULL || (caps
@@ -441,12 +464,142 @@ gst_stream_get_caps (GstStream * stream)
 {
   GstCaps *res = NULL;
 
+  g_return_val_if_fail (GST_IS_STREAM (stream), NULL);
+
   GST_OBJECT_LOCK (stream);
   if (stream->priv->caps)
     res = gst_caps_ref (stream->priv->caps);
   GST_OBJECT_UNLOCK (stream);
 
   return res;
+}
+
+/**
+ * gst_stream_add_component:
+ * @stream: a #GstStream
+ * @component: (transfer none): a component
+ *
+ * Add a @component stream to the list of components this @stream is
+ * made of.
+ *
+ * Since: 1.16
+ */
+
+void
+gst_stream_add_component (GstStream * stream, GstStream * component)
+{
+  g_return_if_fail (GST_IS_STREAM (stream));
+
+  GST_OBJECT_LOCK (stream);
+  g_queue_push_tail (&stream->priv->components, gst_object_ref (component));
+  GST_OBJECT_UNLOCK (stream);
+}
+
+/**
+ * gst_stream_get_components_size:
+ * @stream: a #GstStream
+ *
+ * Get the number of components making up this @stream. If a
+ * stream is not made of sub-components, then the result will be
+ * 0.
+ *
+ * Returns: The number of components making up this stream.
+ *
+ * Since: 1.16
+ */
+guint
+gst_stream_get_components_size (GstStream * stream)
+{
+  guint ret;
+
+  g_return_val_if_fail (GST_IS_STREAM (stream), 0);
+
+  GST_OBJECT_LOCK (stream);
+  ret = g_queue_get_length (&stream->priv->components);
+  GST_OBJECT_UNLOCK (stream);
+
+  return ret;
+}
+
+/**
+ * gst_stream_get_component_idx:
+ * @stream: a #GstStream
+ * @idx: the index of the component to retrieve
+ *
+ * Returns the component of @stream at index @idx.
+ *
+ * Returns: (transfer none): The component, or NULL if @idx is
+ * invalid.
+ *
+ * Since: 1.16
+ */
+GstStream *
+gst_stream_get_component_idx (GstStream * stream, guint idx)
+{
+  GstStream *ret;
+
+  g_return_val_if_fail (GST_IS_STREAM (stream), NULL);
+
+  GST_OBJECT_LOCK (stream);
+  ret = g_queue_peek_nth (&stream->priv->components, idx);
+  GST_OBJECT_UNLOCK (stream);
+
+  return ret;
+}
+
+static guint
+_compare_stream_by_name (GstStream * stream, const gchar * stream_id)
+{
+  return (g_strcmp0 (gst_stream_get_stream_id (stream), stream_id));
+}
+
+/**
+ * gst_stream_has_component_by_name:
+ * @stream: a #GstStream
+ * @stream_id: The stream-id to check
+ *
+ * Checks whether the @stream contains a component with the given
+ * @stream_id.
+ *
+ * Returns: %TRUE if @stream contains @component, else %FALSE.
+ *
+ * Since: 1.16
+ */
+gboolean
+gst_stream_has_component_by_name (GstStream * stream, const gchar * stream_id)
+{
+  GList *tmp;
+
+  g_return_val_if_fail (GST_IS_STREAM (stream), FALSE);
+
+  GST_OBJECT_LOCK (stream);
+  tmp =
+      g_queue_find_custom (&stream->priv->components, stream_id,
+      (GCompareFunc) _compare_stream_by_name);
+  GST_OBJECT_UNLOCK (stream);
+
+  return (tmp != NULL);
+}
+
+/**
+ * gst_stream_has_component:
+ * @stream: a #GstStream
+ * @component: a component #GstStream
+ *
+ * Checks whether the @stream contains the given @component.
+ *
+ * Note: This will check the presence of a component using its
+ * "stream_id" (and not the pointer value).
+ *
+ * Returns: %TRUE if @stream contains @component, else %FALSE.
+ *
+ * Since: 1.16
+ */
+gboolean
+gst_stream_has_component (GstStream * stream, GstStream * component)
+{
+  return gst_stream_has_component_by_name (stream,
+      gst_stream_get_stream_id (component));
 }
 
 static void

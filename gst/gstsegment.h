@@ -137,6 +137,7 @@ typedef enum {
   /* Careful to restart next flag with 1<<7 here */
   GST_SEEK_FLAG_TRICKMODE_KEY_UNITS = (1 << 7),
   GST_SEEK_FLAG_TRICKMODE_NO_AUDIO  = (1 << 8),
+  GST_SEEK_FLAG_REW_EOS         = (1 << 9)
 } GstSeekFlags;
 
 /**

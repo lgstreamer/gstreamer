@@ -152,9 +152,6 @@
 GST_DEBUG_CATEGORY_STATIC (gst_base_sink_debug);
 #define GST_CAT_DEFAULT gst_base_sink_debug
 
-#define GST_BASE_SINK_GET_PRIVATE(obj)  \
-   (G_TYPE_INSTANCE_GET_PRIVATE ((obj), GST_TYPE_BASE_SINK, GstBaseSinkPrivate))
-
 #define GST_FLOW_STEP GST_FLOW_CUSTOM_ERROR
 
 typedef struct
@@ -261,6 +258,8 @@ struct _GstBaseSinkPrivate
   gsize rc_accumulated;
 
   gboolean drop_out_of_segment;
+
+  gboolean reset_stime;
 };
 
 #define DO_RUNNING_AVG(avg,val,size) (((val) + ((size)-1) * (avg)) / (size))
@@ -309,6 +308,7 @@ enum
 };
 
 static GstElementClass *parent_class = NULL;
+static gint private_offset = 0;
 
 static void gst_base_sink_class_init (GstBaseSinkClass * klass);
 static void gst_base_sink_init (GstBaseSink * trans, gpointer g_class);
@@ -335,9 +335,19 @@ gst_base_sink_get_type (void)
 
     _type = g_type_register_static (GST_TYPE_ELEMENT,
         "GstBaseSink", &base_sink_info, G_TYPE_FLAG_ABSTRACT);
+
+    private_offset =
+        g_type_add_instance_private (_type, sizeof (GstBaseSinkPrivate));
+
     g_once_init_leave (&base_sink_type, _type);
   }
   return base_sink_type;
+}
+
+static inline GstBaseSinkPrivate *
+gst_base_sink_get_instance_private (GstBaseSink * self)
+{
+  return (G_STRUCT_MEMBER_P (self, private_offset));
 }
 
 static void gst_base_sink_set_property (GObject * object, guint prop_id,
@@ -407,10 +417,11 @@ gst_base_sink_class_init (GstBaseSinkClass * klass)
   gobject_class = G_OBJECT_CLASS (klass);
   gstelement_class = GST_ELEMENT_CLASS (klass);
 
+  if (private_offset != 0)
+    g_type_class_adjust_private_offset (klass, &private_offset);
+
   GST_DEBUG_CATEGORY_INIT (gst_base_sink_debug, "basesink", 0,
       "basesink element");
-
-  g_type_class_add_private (klass, sizeof (GstBaseSinkPrivate));
 
   parent_class = g_type_class_peek_parent (klass);
 
@@ -622,7 +633,7 @@ gst_base_sink_init (GstBaseSink * basesink, gpointer g_class)
   GstPadTemplate *pad_template;
   GstBaseSinkPrivate *priv;
 
-  basesink->priv = priv = GST_BASE_SINK_GET_PRIVATE (basesink);
+  basesink->priv = priv = gst_base_sink_get_instance_private (basesink);
 
   pad_template =
       gst_element_class_get_pad_template (GST_ELEMENT_CLASS (g_class), "sink");
@@ -660,6 +671,16 @@ gst_base_sink_init (GstBaseSink * basesink, gpointer g_class)
   priv->max_bitrate = DEFAULT_MAX_BITRATE;
 
   priv->drop_out_of_segment = DEFAULT_DROP_OUT_OF_SEGMENT;
+  priv->reset_stime = FALSE;
+
+  basesink->doing_chainfunc = FALSE;
+  basesink->doing_seamless = FALSE;
+  basesink->waiting_chainfunc = FALSE;
+  basesink->waiting_seamless = FALSE;
+  basesink->delay_wakeup_chainfunc = FALSE;
+  g_cond_init (&basesink->chainfunc_cond);
+  g_cond_init (&basesink->seamless_cond);
+  g_mutex_init (&basesink->seamless_lock);
 
   GST_OBJECT_FLAG_SET (basesink, GST_ELEMENT_FLAG_SINK);
 }
@@ -673,6 +694,10 @@ gst_base_sink_finalize (GObject * object)
 
   g_mutex_clear (&basesink->preroll_lock);
   g_cond_clear (&basesink->preroll_cond);
+
+  g_mutex_clear (&basesink->seamless_lock);
+  g_cond_clear (&basesink->chainfunc_cond);
+  g_cond_clear (&basesink->seamless_cond);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -734,14 +759,10 @@ void
 gst_base_sink_set_drop_out_of_segment (GstBaseSink * sink,
     gboolean drop_out_of_segment)
 {
-  GstBaseSinkPrivate *priv;
-
   g_return_if_fail (GST_IS_BASE_SINK (sink));
 
-  priv = GST_BASE_SINK_GET_PRIVATE (sink);
-
   GST_OBJECT_LOCK (sink);
-  priv->drop_out_of_segment = drop_out_of_segment;
+  sink->priv->drop_out_of_segment = drop_out_of_segment;
   GST_OBJECT_UNLOCK (sink);
 
 }
@@ -761,15 +782,12 @@ gst_base_sink_set_drop_out_of_segment (GstBaseSink * sink,
 gboolean
 gst_base_sink_get_drop_out_of_segment (GstBaseSink * sink)
 {
-  GstBaseSinkPrivate *priv;
   gboolean res;
 
   g_return_val_if_fail (GST_IS_BASE_SINK (sink), FALSE);
 
-  priv = GST_BASE_SINK_GET_PRIVATE (sink);
-
   GST_OBJECT_LOCK (sink);
-  res = priv->drop_out_of_segment;
+  res = sink->priv->drop_out_of_segment;
   GST_OBJECT_UNLOCK (sink);
 
   return res;
@@ -1579,7 +1597,7 @@ gst_base_sink_commit_state (GstBaseSink * basesink)
             current, next, post_pending));
   }
   if (post_async_done) {
-    GST_DEBUG_OBJECT (basesink, "posting async-done message");
+    GST_SYS_DEBUG_OBJECT (basesink, "posting async-done message");
     gst_element_post_message (GST_ELEMENT_CAST (basesink),
         gst_message_new_async_done (GST_OBJECT_CAST (basesink),
             GST_CLOCK_TIME_NONE));
@@ -1605,7 +1623,7 @@ gst_base_sink_commit_state (GstBaseSink * basesink)
       if (G_UNLIKELY (basesink->flushing))
         goto stopping_unlocked;
     }
-    GST_DEBUG_OBJECT (basesink, "posting PLAYING state change message");
+    GST_SYS_DEBUG_OBJECT (basesink, "posting PLAYING state change message");
     /* FIXME, we released the PREROLL lock above, it's possible that this
      * message is not correct anymore when the element went back to PAUSED */
     gst_element_post_message (GST_ELEMENT_CAST (basesink),
@@ -1966,7 +1984,7 @@ again:
         GstClockTime timestamp, duration;
         gst_event_parse_gap (event, &timestamp, &duration);
 
-        GST_DEBUG_OBJECT (basesink, "Got Gap time %" GST_TIME_FORMAT
+        GST_SYS_DEBUG_OBJECT (basesink, "Got Gap time %" GST_TIME_FORMAT
             " duration %" GST_TIME_FORMAT,
             GST_TIME_ARGS (timestamp), GST_TIME_ARGS (duration));
 
@@ -2160,6 +2178,7 @@ gst_base_sink_wait_clock (GstBaseSink * sink, GstClockTime time,
   GstClockReturn ret;
   GstClock *clock;
   GstClockTime base_time;
+  GstBaseSinkPrivate *priv = gst_base_sink_get_instance_private (sink);
 
   if (G_UNLIKELY (!GST_CLOCK_TIME_IS_VALID (time)))
     goto invalid_time;
@@ -2170,6 +2189,12 @@ gst_base_sink_wait_clock (GstBaseSink * sink, GstClockTime time,
 
   if (G_UNLIKELY ((clock = GST_ELEMENT_CLOCK (sink)) == NULL))
     goto no_clock;
+
+  if (priv->reset_stime) {
+    priv->reset_stime = FALSE;
+    GST_DEBUG_OBJECT (sink, "Reset stime to 0 !!");
+    time = 0;
+  }
 
   base_time = GST_ELEMENT_CAST (sink)->base_time;
   GST_LOG_OBJECT (sink,
@@ -2309,7 +2334,7 @@ gst_base_sink_do_preroll (GstBaseSink * sink, GstMiniObject * obj)
   GstFlowReturn ret;
 
   while (G_UNLIKELY (sink->need_preroll)) {
-    GST_DEBUG_OBJECT (sink, "prerolling object %p", obj);
+    GST_SYS_DEBUG_OBJECT (sink, "prerolling object %p", obj);
 
     /* if it's a buffer, we need to call the preroll method */
     if (sink->priv->call_preroll) {
@@ -2331,8 +2356,15 @@ gst_base_sink_do_preroll (GstBaseSink * sink, GstMiniObject * obj)
       }
 
       if (buf) {
-        GST_DEBUG_OBJECT (sink, "preroll buffer %" GST_TIME_FORMAT,
+        GST_SYS_DEBUG_OBJECT (sink, "preroll buffer %" GST_TIME_FORMAT,
             GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (buf)));
+
+        GST_BASE_SINK_SEAMLESS_LOCK (sink);
+        if (sink->doing_chainfunc) {
+          sink->doing_chainfunc = FALSE;
+          GST_BASE_SINK_CHAINFUNC_SIGNAL (sink);
+        }
+        GST_BASE_SINK_SEAMLESS_UNLOCK (sink);
 
         bclass = GST_BASE_SINK_GET_CLASS (sink);
 
@@ -2608,6 +2640,10 @@ again:
 
   GST_DEBUG_OBJECT (basesink, "clock returned %d, jitter %c%" GST_TIME_FORMAT,
       status, (jitter < 0 ? '-' : ' '), GST_TIME_ARGS (ABS (jitter)));
+  if (jitter > 1 * GST_SECOND)
+    GST_SYS_WARNING_OBJECT (basesink,
+        "clock returned %d, jitter %c%" GST_TIME_FORMAT, status,
+        (jitter < 0 ? '-' : ' '), GST_TIME_ARGS (ABS (jitter)));
 
   /* invalid time, no clock or sync disabled, just render */
   if (status == GST_CLOCK_BADTIME)
@@ -2649,7 +2685,7 @@ not_syncable:
   }
 qos_dropped:
   {
-    GST_DEBUG_OBJECT (basesink, "dropped because of QoS %p", obj);
+    GST_SYS_DEBUG_OBJECT (basesink, "dropped because of QoS %p", obj);
     *late = TRUE;
     return GST_FLOW_OK;
   }
@@ -2888,7 +2924,7 @@ gst_base_sink_is_too_late (GstBaseSink * basesink, GstMiniObject * obj,
 
   /* if the jitter bigger than duration and lateness we are too late */
   if ((late = rstart + jitter > max_lateness)) {
-    GST_CAT_DEBUG_OBJECT (GST_CAT_PERFORMANCE, basesink,
+    GST_SYS_CAT_DEBUG_OBJECT (GST_CAT_PERFORMANCE, basesink,
         "buffer is too late %" GST_TIME_FORMAT
         " > %" GST_TIME_FORMAT, GST_TIME_ARGS (rstart + jitter),
         GST_TIME_ARGS (max_lateness));
@@ -3003,6 +3039,18 @@ gst_base_sink_flush_start (GstBaseSink * basesink, GstPad * pad)
   }
   gst_base_sink_set_last_buffer (basesink, NULL);
   gst_base_sink_set_last_buffer_list (basesink, NULL);
+
+  GST_BASE_SINK_SEAMLESS_LOCK (basesink);
+  if (basesink->doing_chainfunc) {
+    basesink->doing_chainfunc = FALSE;
+    GST_BASE_SINK_CHAINFUNC_SIGNAL (basesink);
+  }
+  if (basesink->doing_seamless) {
+    basesink->doing_seamless = FALSE;
+    GST_BASE_SINK_SEAMLESS_SIGNAL (basesink);
+  }
+  GST_BASE_SINK_SEAMLESS_UNLOCK (basesink);
+
   GST_PAD_STREAM_UNLOCK (pad);
 }
 
@@ -3078,7 +3126,7 @@ gst_base_sink_default_event (GstBaseSink * basesink, GstEvent * event)
   switch (GST_EVENT_TYPE (event)) {
     case GST_EVENT_FLUSH_START:
     {
-      GST_DEBUG_OBJECT (basesink, "flush-start %p", event);
+      GST_SYS_DEBUG_OBJECT (basesink, "flush-start %p", event);
       gst_base_sink_flush_start (basesink, basesink->sinkpad);
       break;
     }
@@ -3087,7 +3135,7 @@ gst_base_sink_default_event (GstBaseSink * basesink, GstEvent * event)
       gboolean reset_time;
 
       gst_event_parse_flush_stop (event, &reset_time);
-      GST_DEBUG_OBJECT (basesink, "flush-stop %p, reset_time: %d", event,
+      GST_SYS_DEBUG_OBJECT (basesink, "flush-stop %p, reset_time: %d", event,
           reset_time);
       gst_base_sink_flush_stop (basesink, basesink->sinkpad, reset_time);
       break;
@@ -3117,7 +3165,7 @@ gst_base_sink_default_event (GstBaseSink * basesink, GstEvent * event)
       GST_OBJECT_UNLOCK (basesink);
 
       /* ok, now we can post the message */
-      GST_DEBUG_OBJECT (basesink, "Now posting EOS");
+      GST_SYS_DEBUG_OBJECT (basesink, "Now posting EOS");
 
       seqnum = basesink->priv->seqnum = gst_event_get_seqnum (event);
       GST_DEBUG_OBJECT (basesink, "Got seqnum #%" G_GUINT32_FORMAT, seqnum);
@@ -3188,6 +3236,8 @@ gst_base_sink_default_event (GstBaseSink * basesink, GstEvent * event)
       basesink->have_newsegment = TRUE;
       gst_base_sink_reset_qos (basesink);
       GST_OBJECT_UNLOCK (basesink);
+      GST_SYS_DEBUG_OBJECT (basesink, "configured segment %" GST_SEGMENT_FORMAT,
+          &basesink->segment);
       break;
     case GST_EVENT_GAP:
     {
@@ -3337,8 +3387,9 @@ gst_base_sink_needs_preroll (GstBaseSink * basesink)
   is_prerolled = basesink->have_preroll || basesink->priv->received_eos;
   res = !is_prerolled;
 
-  GST_DEBUG_OBJECT (basesink, "have_preroll: %d, EOS: %d => needs preroll: %d",
-      basesink->have_preroll, basesink->priv->received_eos, res);
+  GST_SYS_DEBUG_OBJECT (basesink,
+      "have_preroll: %d, EOS: %d => needs preroll: %d", basesink->have_preroll,
+      basesink->priv->received_eos, res);
 
   return res;
 }
@@ -3389,6 +3440,8 @@ gst_base_sink_chain_unlocked (GstBaseSink * basesink, GstPad * pad,
 
     sync = gst_base_sink_get_sync (basesink);
     if (sync) {
+      GST_SYS_WARNING_OBJECT (basesink,
+          "Received buffer without a new-segment. Internal data flow problem.");
       GST_ELEMENT_WARNING (basesink, STREAM, FAILED,
           (_("Internal data flow problem.")),
           ("Received buffer without a new-segment. Assuming timestamps start from 0."));
@@ -3600,7 +3653,7 @@ empty_list:
   }
 out_of_segment:
   {
-    GST_DEBUG_OBJECT (basesink, "dropping buffer, out of clipping segment");
+    GST_SYS_DEBUG_OBJECT (basesink, "dropping buffer, out of clipping segment");
     gst_mini_object_unref (GST_MINI_OBJECT_CAST (obj));
     return GST_FLOW_OK;
   }
@@ -3619,7 +3672,7 @@ sync_failed:
 dropped:
   {
     priv->dropped++;
-    GST_DEBUG_OBJECT (basesink, "buffer late, dropping");
+    GST_SYS_DEBUG_OBJECT (basesink, "buffer late, dropping");
 
     if (g_atomic_int_get (&priv->qos_enabled)) {
       GstMessage *qos_msg;
@@ -3930,6 +3983,92 @@ gst_base_sink_perform_seek (GstBaseSink * sink, GstPad * pad, GstEvent * event)
   sink->running = TRUE;
 
   GST_PAD_STREAM_UNLOCK (pad);
+
+  return res;
+}
+
+static gboolean
+gst_base_sink_prepare_seamless_seek (GstBaseSink * sink, GstSegment * segment,
+    gboolean reset_start_time, gboolean update_base_time,
+    GstClockTime btime, gboolean propagate)
+{
+  GstBaseSinkClass *bclass;
+  gboolean res = FALSE;
+  GstSegment new_segment;
+  GstClockTime new_base_time;
+  GstElement *top;
+  GstPipeline *pipe;
+
+  bclass = GST_BASE_SINK_GET_CLASS (sink);
+
+  GST_DEBUG_OBJECT (sink, "new segment: %" GST_PTR_FORMAT, segment);
+
+  top = (GstElement *) sink;
+  while (GST_ELEMENT_PARENT (top))
+    top = GST_ELEMENT_PARENT (top);
+
+  pipe = (GstPipeline *) top;
+
+  if (reset_start_time) {
+    GST_DEBUG_OBJECT (sink, "Reset start-time to 0");
+    gst_pipeline_reset_start_time (pipe, 0);
+  }
+
+  if (btime != GST_CLOCK_TIME_NONE)
+    new_base_time = btime;
+  else
+#if 1
+    new_base_time =
+        gst_pipeline_get_base_time (pipe,
+        (reset_start_time ? 0 : GST_CLOCK_TIME_NONE));
+#endif
+#if 0
+  new_base_time = GST_ELEMENT_CAST (sink)->base_time;
+#endif
+  GST_DEBUG_OBJECT (sink, "New base-time %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (new_base_time));
+
+  memcpy (&new_segment, segment, sizeof (GstSegment));
+
+  if (bclass->prepare_seamless_seek)
+    res = bclass->prepare_seamless_seek (sink, &new_segment, new_base_time);
+
+  GST_DEBUG_OBJECT (sink, "segment configured from %" G_GINT64_FORMAT
+      " to %" G_GINT64_FORMAT ", position %" G_GINT64_FORMAT,
+      new_segment.start, new_segment.stop, new_segment.position);
+
+  GST_INFO_OBJECT (sink, "seeking done %d: %" GST_SEGMENT_FORMAT, res,
+      &new_segment);
+
+  gst_segment_copy_into (&new_segment, &sink->segment);
+
+  sink->have_newsegment = TRUE;
+  gst_base_sink_reset_qos (sink);
+
+  if (GST_STATE (sink) != GST_STATE_PLAYING) {
+    GstBaseSinkPrivate *priv = gst_base_sink_get_instance_private (sink);
+    GST_DEBUG_OBJECT (sink, "Reset stime to sync between now and base-time !!");
+    priv->reset_stime = TRUE;
+  }
+
+  if (sink->segment.flags & GST_SEGMENT_FLAG_SEGMENT) {
+    gst_element_post_message (GST_ELEMENT (sink),
+        gst_message_new_segment_start (GST_OBJECT (sink),
+            sink->segment.format, sink->segment.position));
+  }
+
+  sink->priv->discont = TRUE;
+
+  if (update_base_time) {
+    GST_DEBUG_OBJECT (sink, "Update new base-time");
+    gst_pipeline_update_base_time ((GstPipeline *) pipe, new_base_time);
+  }
+
+  if (propagate) {
+    GST_DEBUG_OBJECT (sink, "Propagate new base-time and start-time");
+    GST_ELEMENT_CAST (sink)->base_time = new_base_time;
+    GST_ELEMENT_CAST (sink)->start_time = 0;
+  }
 
   return res;
 }
@@ -4500,6 +4639,83 @@ gst_base_sink_send_event (GstElement * element, GstEvent * event)
       result = gst_base_sink_perform_step (basesink, pad, event);
       forward = FALSE;
       break;
+    case GST_EVENT_CUSTOM_UPSTREAM:
+    {
+      if (gst_event_has_name (event, "prepare-seamless-seek")) {
+        const GstStructure *s;
+        const GValue *segment_info;
+
+        GST_DEBUG_OBJECT (basesink, "Doing NON-FLUSH seek");
+        forward = FALSE;
+        s = gst_event_get_structure (event);
+
+        /* Parse new segment and propagate sub-class */
+        segment_info = gst_structure_get_value (s, "segment-info");
+        GST_DEBUG_OBJECT (basesink, "segment-info: %p", segment_info);
+        if (segment_info && G_VALUE_TYPE (segment_info) == GST_TYPE_SEGMENT) {
+          gboolean reset_start_time = FALSE;
+          gboolean update_base_time = FALSE;
+          gboolean propagate = FALSE;
+          GstClockTime new_base_time = GST_CLOCK_TIME_NONE;
+          GstSegment *new_segment = NULL;
+          const GValue *reset_value;
+          const GValue *update_value;
+          const GValue *time_value;
+          const GValue *propagate_value;
+
+          new_segment = (GstSegment *) g_value_dup_boxed (segment_info);
+          GST_DEBUG_OBJECT (basesink, "new_segment: %" GST_PTR_FORMAT,
+              new_segment);
+
+          reset_value = gst_structure_get_value (s, "reset-start-time");
+          if (reset_value)
+            reset_start_time = g_value_get_boolean (reset_value);
+
+          update_value = gst_structure_get_value (s, "update-base-time");
+          if (update_value)
+            update_base_time = g_value_get_boolean (update_value);
+
+          time_value = gst_structure_get_value (s, "new-base-time");
+          if (time_value)
+            new_base_time = (GstClockTime) g_value_get_uint64 (time_value);
+
+          propagate_value = gst_structure_get_value (s, "propagate");
+          if (propagate_value)
+            propagate = g_value_get_boolean (propagate_value);
+
+          if (gst_segment_is_equal (new_segment, &basesink->segment)) {
+            GST_DEBUG_OBJECT (basesink,
+                "Return immediately when new segment is equal to old segment !!");
+            g_boxed_free (GST_TYPE_SEGMENT, new_segment);
+            return FALSE;
+          }
+
+          GST_BASE_SINK_SEAMLESS_LOCK (basesink);
+          while (basesink->doing_chainfunc) {
+            basesink->waiting_chainfunc = TRUE;
+            GST_BASE_SINK_CHAINFUNC_WAIT (basesink);
+            basesink->waiting_chainfunc = FALSE;
+          }
+          GST_DEBUG_OBJECT (basesink, "Before seamless seek");
+          basesink->doing_seamless = TRUE;
+          GST_BASE_SINK_PREROLL_LOCK (basesink);
+          result =
+              gst_base_sink_prepare_seamless_seek (basesink, new_segment,
+              reset_start_time, update_base_time, new_base_time, propagate);
+          g_boxed_free (GST_TYPE_SEGMENT, new_segment);
+          GST_BASE_SINK_PREROLL_UNLOCK (basesink);
+
+          basesink->doing_seamless = FALSE;
+          GST_DEBUG_OBJECT (basesink, "After seamless seek");
+          if (basesink->waiting_seamless) {
+            GST_DEBUG_OBJECT (basesink, "Wake up !!");
+            GST_BASE_SINK_SEAMLESS_SIGNAL (basesink);
+          }
+          GST_BASE_SINK_SEAMLESS_UNLOCK (basesink);
+        }
+      }
+      break;
+    }
     default:
       break;
   }
@@ -4628,7 +4844,7 @@ gst_base_sink_get_position (GstBaseSink * basesink, GstFormat format,
       if (stop == -1 || segment->rate > 0.0)
         last = start;
       else
-        last = stop;
+        last = MIN (stop, *cur);
 
       GST_DEBUG_OBJECT (basesink, "in PAUSED using last %" GST_TIME_FORMAT,
           GST_TIME_ARGS (last));
@@ -5098,7 +5314,8 @@ gst_base_sink_change_state (GstElement * element, GstStateChange transition)
       GST_BASE_SINK_PREROLL_LOCK (basesink);
       g_atomic_int_set (&basesink->priv->to_playing, TRUE);
       if (!gst_base_sink_needs_preroll (basesink)) {
-        GST_DEBUG_OBJECT (basesink, "PAUSED to PLAYING, don't need preroll");
+        GST_SYS_DEBUG_OBJECT (basesink,
+            "PAUSED to PLAYING, don't need preroll");
         /* no preroll needed anymore now. */
         basesink->playing_async = FALSE;
         basesink->need_preroll = FALSE;
@@ -5115,7 +5332,8 @@ gst_base_sink_change_state (GstElement * element, GstStateChange transition)
           GST_BASE_SINK_PREROLL_SIGNAL (basesink);
         }
       } else {
-        GST_DEBUG_OBJECT (basesink, "PAUSED to PLAYING, we are not prerolled");
+        GST_SYS_DEBUG_OBJECT (basesink,
+            "PAUSED to PLAYING, we are not prerolled");
         basesink->need_preroll = TRUE;
         basesink->playing_async = TRUE;
         priv->call_preroll = TRUE;
@@ -5150,7 +5368,7 @@ gst_base_sink_change_state (GstElement * element, GstStateChange transition)
       break;
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
       g_atomic_int_set (&basesink->priv->to_playing, FALSE);
-      GST_DEBUG_OBJECT (basesink, "PLAYING to PAUSED");
+      GST_SYS_DEBUG_OBJECT (basesink, "PLAYING to PAUSED");
       /* FIXME, make sure we cannot enter _render first */
 
       /* we need to call ::unlock before locking PREROLL_LOCK
@@ -5172,7 +5390,7 @@ gst_base_sink_change_state (GstElement * element, GstStateChange transition)
       /* if we don't have a preroll buffer we need to wait for a preroll and
        * return ASYNC. */
       if (!gst_base_sink_needs_preroll (basesink)) {
-        GST_DEBUG_OBJECT (basesink, "PLAYING to PAUSED, we are prerolled");
+        GST_SYS_DEBUG_OBJECT (basesink, "PLAYING to PAUSED, we are prerolled");
         basesink->playing_async = FALSE;
         basesink->need_preroll = FALSE;
       } else {
@@ -5180,7 +5398,7 @@ gst_base_sink_change_state (GstElement * element, GstStateChange transition)
           GST_DEBUG_OBJECT (basesink, "element is <= READY");
           ret = GST_STATE_CHANGE_SUCCESS;
         } else {
-          GST_DEBUG_OBJECT (basesink,
+          GST_SYS_DEBUG_OBJECT (basesink,
               "PLAYING to PAUSED, we are not prerolled");
           basesink->playing_async = TRUE;
           basesink->need_preroll = TRUE;
@@ -5194,6 +5412,17 @@ gst_base_sink_change_state (GstElement * element, GstStateChange transition)
           }
         }
       }
+      GST_BASE_SINK_SEAMLESS_LOCK (basesink);
+      if (basesink->doing_chainfunc) {
+        basesink->doing_chainfunc = FALSE;
+        GST_BASE_SINK_CHAINFUNC_SIGNAL (basesink);
+      }
+      if (basesink->doing_seamless) {
+        basesink->doing_seamless = FALSE;
+        GST_BASE_SINK_SEAMLESS_SIGNAL (basesink);
+      }
+      GST_BASE_SINK_SEAMLESS_UNLOCK (basesink);
+
       GST_DEBUG_OBJECT (basesink, "rendered: %" G_GUINT64_FORMAT
           ", dropped: %" G_GUINT64_FORMAT, priv->rendered, priv->dropped);
 

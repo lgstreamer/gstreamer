@@ -126,7 +126,7 @@ gst_sample_new (GstBuffer * buffer, GstCaps * caps, const GstSegment * segment,
   if (segment)
     gst_segment_copy_into (segment, &sample->segment);
   else
-    gst_segment_init (&sample->segment, GST_FORMAT_TIME);
+    gst_segment_init (&sample->segment, GST_FORMAT_UNDEFINED);
 
   if (info) {
     if (!gst_structure_set_parent_refcount (info,

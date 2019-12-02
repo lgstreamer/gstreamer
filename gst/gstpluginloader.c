@@ -472,9 +472,7 @@ gst_plugin_loader_spawn (GstPluginLoader * loader)
     helper_bin = g_strdup (env);
     res = gst_plugin_loader_try_helper (loader, helper_bin);
     g_free (helper_bin);
-  }
-
-  if (!res) {
+  } else {
     GST_LOG ("Trying installed plugin scanner");
 
 #ifdef G_OS_WIN32

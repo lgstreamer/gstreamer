@@ -74,6 +74,7 @@
 #include <gst/gstsegment.h>
 #include <gst/gststreams.h>
 #include <gst/gststructure.h>
+#include <gst/gstsyslog.h>
 #include <gst/gstsystemclock.h>
 #include <gst/gsttaglist.h>
 #include <gst/gsttagsetter.h>

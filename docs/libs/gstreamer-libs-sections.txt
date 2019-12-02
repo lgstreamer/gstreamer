@@ -331,6 +331,7 @@ gst_base_src_set_do_timestamp
 gst_base_src_set_dynamic_size
 gst_base_src_set_automatic_eos
 gst_base_src_new_seamless_segment
+gst_base_src_new_segment
 gst_base_src_set_caps
 gst_base_src_get_allocator
 gst_base_src_get_buffer_pool

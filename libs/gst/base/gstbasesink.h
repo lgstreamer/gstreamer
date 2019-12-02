@@ -58,6 +58,71 @@ G_BEGIN_DECLS
 #define GST_BASE_SINK_PREROLL_SIGNAL(obj)     g_cond_signal (GST_BASE_SINK_GET_PREROLL_COND (obj));
 #define GST_BASE_SINK_PREROLL_BROADCAST(obj)  g_cond_broadcast (GST_BASE_SINK_GET_PREROLL_COND (obj));
 
+#define GST_BASE_SINK_GET_SEAMLESS_LOCK(obj)   (&GST_BASE_SINK_CAST(obj)->seamless_lock)
+#define GST_BASE_SINK_SEAMLESS_LOCK(obj) G_STMT_START {        \
+    GST_TRACE_OBJECT (obj,                                     \
+                    "seamless locking from thread %p",         \
+                    g_thread_self ());                         \
+    g_mutex_lock (GST_BASE_SINK_GET_SEAMLESS_LOCK(obj));       \
+    GST_TRACE_OBJECT (obj,                                     \
+                    "seamless locked from thread %p",          \
+                    g_thread_self ());                         \
+  } G_STMT_END
+
+#define GST_BASE_SINK_SEAMLESS_UNLOCK(obj) G_STMT_START {      \
+    GST_TRACE_OBJECT (obj,                                     \
+                    "seamless unlocking from thread %p",       \
+                    g_thread_self ());                         \
+    g_mutex_unlock (GST_BASE_SINK_GET_SEAMLESS_LOCK(obj));     \
+    GST_TRACE_OBJECT (obj,                                     \
+                    "seamless unlocked from thread %p",        \
+                    g_thread_self ());                         \
+  } G_STMT_END
+
+#define GST_BASE_SINK_GET_SEAMLESS_COND(obj)   (&GST_BASE_SINK_CAST(obj)->seamless_cond)
+
+#define GST_BASE_SINK_SEAMLESS_WAIT(obj) G_STMT_START {                                         \
+    GST_TRACE_OBJECT (obj,                                                                      \
+                    "Waiting for seamless to finish %p",                                        \
+                    g_thread_self ());                                                          \
+    g_cond_wait (GST_BASE_SINK_GET_SEAMLESS_COND (obj), GST_BASE_SINK_GET_SEAMLESS_LOCK (obj)); \
+    GST_TRACE_OBJECT (obj,                                                                      \
+                    "Finished Waiting seamless %p",                                             \
+                    g_thread_self ());                                                          \
+  } G_STMT_END
+
+#define GST_BASE_SINK_SEAMLESS_SIGNAL(obj) G_STMT_START {    \
+    GST_TRACE_OBJECT (obj,                                   \
+                    "Unblocking a seamless cond %p",         \
+                   g_thread_self ());                        \
+    g_cond_signal (GST_BASE_SINK_GET_SEAMLESS_COND (obj));   \
+    GST_TRACE_OBJECT (obj,                                   \
+                    "Unblocked a seamless cond %p",          \
+                   g_thread_self ());                        \
+  } G_STMT_END
+
+#define GST_BASE_SINK_GET_CHAINFUNC_COND(obj)   (&GST_BASE_SINK_CAST(obj)->chainfunc_cond)
+
+#define GST_BASE_SINK_CHAINFUNC_WAIT(obj) G_STMT_START {                                         \
+    GST_TRACE_OBJECT (obj,                                                                       \
+                    "Waiting for chainfunc to finish %p",                                        \
+                    g_thread_self ());                                                           \
+    g_cond_wait (GST_BASE_SINK_GET_CHAINFUNC_COND (obj), GST_BASE_SINK_GET_SEAMLESS_LOCK (obj)); \
+    GST_TRACE_OBJECT (obj,                                                                       \
+                    "Finished Waiting chainfunc %p",                                             \
+                    g_thread_self ());                                                           \
+  } G_STMT_END
+
+#define GST_BASE_SINK_CHAINFUNC_SIGNAL(obj) G_STMT_START {  \
+    GST_TRACE_OBJECT (obj,                                  \
+                    "Unblocking a chainfunc cond %p",       \
+                   g_thread_self ());                       \
+    g_cond_signal (GST_BASE_SINK_GET_CHAINFUNC_COND (obj)); \
+    GST_TRACE_OBJECT (obj,                                  \
+                    "Unblocked a chainfunc cond %p",        \
+                   g_thread_self ());                       \
+  } G_STMT_END
+
 typedef struct _GstBaseSink GstBaseSink;
 typedef struct _GstBaseSinkClass GstBaseSinkClass;
 typedef struct _GstBaseSinkPrivate GstBaseSinkPrivate;
@@ -98,6 +163,16 @@ struct _GstBaseSink {
   gboolean       running;
 
   gint64         max_lateness;
+
+  /* For prepare-seamless-seek */
+  GMutex seamless_lock;
+  gboolean doing_chainfunc;
+  gboolean waiting_chainfunc;
+  gboolean delay_wakeup_chainfunc;
+  GCond chainfunc_cond;
+  gboolean doing_seamless;
+  gboolean waiting_seamless;
+  GCond seamless_cond;
 
   /*< private >*/
   GstBaseSinkPrivate *priv;
@@ -197,6 +272,9 @@ struct _GstBaseSinkClass {
   GstFlowReturn (*render)       (GstBaseSink *sink, GstBuffer *buffer);
   /* Render a BufferList */
   GstFlowReturn (*render_list)  (GstBaseSink *sink, GstBufferList *buffer_list);
+
+  /* notify subclass of seamless-seek */
+  gboolean      (*prepare_seamless_seek) (GstBaseSink *sink, GstSegment *segment, GstClockTime new_base_time);
 
   /*< private >*/
   gpointer       _gst_reserved[GST_PADDING_LARGE];
