@@ -52,12 +52,11 @@ cd gstreamer
 ./autogen.sh --noconfigure
 patch -p1 < gstreamer-1.14.4-make43.patch
 ./autogen.sh --host=arm-webos-linux-gnueabi --with-sysroot=${SDKTARGETSYSROOT} \
-  --prefix=${SDKTARGETSYSROOT}/usr/ \
-  --disable-silent-rules --disable-dependency-tracking --disable-gtk-doc \
+  --prefix=${SDKTARGETSYSROOT}/usr/ --disable-silent-rules \
+  --disable-dependency-tracking --disable-gtk-doc \
   --disable-introspection --disable-examples --disable-tests \
   --disable-valgrind --disable-debug --enable-fatal-warnings \
   --enable-system-log --disable-static --without-dw \
-  --enable-gst-tracer-hooks --disable-tests --without-unwind \
-  --disable-valgrind --enable-nls
+  --enable-gst-tracer-hooks --without-unwind --enable-nls
 make -j6 install
 ```

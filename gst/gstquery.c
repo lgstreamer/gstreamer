@@ -2536,10 +2536,57 @@ gst_query_new_drain (void)
   GstQuery *query;
   GstStructure *structure;
 
-  structure = gst_structure_new_id_empty (GST_QUARK (QUERY_DRAIN));
+  structure = gst_structure_new_id (GST_QUARK (QUERY_DRAIN),
+      GST_QUARK (RELEASE_NON_MAPPABLE), G_TYPE_BOOLEAN, FALSE, NULL);
   query = gst_query_new_custom (GST_QUERY_DRAIN, structure);
 
   return query;
+}
+
+/**
+ * gst_query_set_drain:
+ * @query: A valid #GstQuery of type GST_QUERY_DRAIN.
+ * @release_non_mappable: the non-mappable memory release property. If the memory
+ *                        is an non-mappable dmabuf, it helps to remove reference
+ *                        in the drain step which blocking to release bufferpool
+ *
+ * Set the drain properties.
+ * FIXME: It could be removed once the videobuffer2 orphan buf is supported
+ */
+void
+gst_query_set_drain (GstQuery * query, gboolean release_non_mappable)
+{
+  GstStructure *structure;
+
+  g_return_if_fail (GST_QUERY_TYPE (query) == GST_QUERY_DRAIN);
+  g_return_if_fail (gst_query_is_writable (query));
+
+  structure = GST_QUERY_STRUCTURE (query);
+  gst_structure_id_set (structure,
+      GST_QUARK (RELEASE_NON_MAPPABLE), G_TYPE_BOOLEAN, release_non_mappable,
+      NULL);
+}
+
+/**
+ * gst_query_parse_drain:
+ * @query: A valid #GstQuery of type GST_QUERY_DRAIN.
+ * @release_non_mappable: (out) (allow-none): the non-mappable memory release
+ *                                            property
+ *
+ * Parse the drain properties.
+ * FIXME: It could be removed once the videobuffer2 orphan buf is supported
+ */
+void
+gst_query_parse_drain (GstQuery * query, gboolean * release_non_mappable)
+{
+  GstStructure *structure;
+
+  g_return_if_fail (GST_QUERY_TYPE (query) == GST_QUERY_DRAIN);
+
+  structure = GST_QUERY_STRUCTURE (query);
+  gst_structure_id_get (structure,
+      GST_QUARK (RELEASE_NON_MAPPABLE), G_TYPE_BOOLEAN, release_non_mappable,
+      NULL);
 }
 
 /**

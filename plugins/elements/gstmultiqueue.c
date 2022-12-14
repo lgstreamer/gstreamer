@@ -1894,7 +1894,7 @@ gst_multi_queue_needs_bumping (GstMultiQueue * mq, GstClockTime low,
 
     if (is_overrun_bytes) {
       mq->max_size.bytes = overrun_max_bytes + (0.5 * 1024 * 1024);
-      GST_FIXME_OBJECT (mq, "%s Bumping up max-size-bytes to %d",
+      GST_SYS_FIXME_OBJECT (mq, "%s Bumping up max-size-bytes to %d",
           (is_preroll ? "[Prerolling]" : ""), mq->max_size.bytes);
       SET_CHILD_PROPERTY (mq, bytes);
     }
@@ -2949,6 +2949,19 @@ gst_multi_queue_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
       /* Remove EOS flag */
       sq->is_eos = FALSE;
       sq->is_drained = FALSE;
+
+      GST_MULTI_QUEUE_MUTEX_LOCK (mq);
+      if (mq->use_interleave && mq->interleave_by_serialized_event) {
+        if (mq->max_size.bytes > DEFAULT_MAX_SIZE_BYTES) {
+          mq->max_size.bytes = DEFAULT_MAX_SIZE_BYTES;
+          GST_SYS_DEBUG_OBJECT (mq,
+              "SingleQueue %d : Recovering default max-size-bytes(%d) by stream-start",
+              sq->id, mq->max_size.bytes);
+          SET_CHILD_PROPERTY (mq, bytes);
+        }
+      }
+      GST_MULTI_QUEUE_MUTEX_UNLOCK (mq);
+
       break;
     }
     case GST_EVENT_FLUSH_START:
@@ -3022,12 +3035,14 @@ gst_multi_queue_sink_event (GstPad * pad, GstObject * parent, GstEvent * event)
   item = gst_multi_queue_mo_item_new ((GstMiniObject *) event, curid);
 
   GST_MULTI_QUEUE_MUTEX_LOCK (mq);
-  if (mq->use_interleave && mq->interleave_by_serialized_event) {
+  /* FIXME : ONLY FOR EOS */
+  if (mq->use_interleave && mq->interleave_by_serialized_event
+      && type == GST_EVENT_EOS) {
     if (mq->max_size.bytes > DEFAULT_MAX_SIZE_BYTES) {
       mq->max_size.bytes = DEFAULT_MAX_SIZE_BYTES;
-      GST_DEBUG_OBJECT (mq,
-          "SingleQueue %d : Recovering default max-size-bytes(%d)", sq->id,
-          mq->max_size.bytes);
+      GST_SYS_DEBUG_OBJECT (mq,
+          "SingleQueue %d : Recovering default max-size-bytes(%d) by eos",
+          sq->id, mq->max_size.bytes);
       SET_CHILD_PROPERTY (mq, bytes);
     }
 

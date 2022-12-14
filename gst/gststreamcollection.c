@@ -278,10 +278,15 @@ static void
 proxy_stream_notify_cb (GstStream * stream, GParamSpec * pspec,
     GstStreamCollection * collection)
 {
+  g_return_if_fail (GST_IS_STREAM (stream));
+  g_return_if_fail (GST_IS_STREAM_COLLECTION (collection));
+
+  gst_object_ref (collection);
   GST_DEBUG_OBJECT (collection, "Stream %" GST_PTR_FORMAT " updated %s",
       stream, pspec->name);
   g_signal_emit (collection, gst_stream_collection_signals[SIG_STREAM_NOTIFY],
       g_quark_from_string (pspec->name), stream, pspec);
+  gst_object_unref (collection);
 }
 
 /**

@@ -629,6 +629,13 @@ void            gst_query_parse_caps_result        (GstQuery *query, GstCaps **c
 GST_API
 GstQuery *      gst_query_new_drain                (void) G_GNUC_MALLOC;
 
+/* FIXME: It could be removed once the videobuffer2 orphan buf is supported */
+GST_API
+void            gst_query_set_drain                (GstQuery *query, gboolean release_non_mappable);
+GST_API
+void            gst_query_parse_drain              (GstQuery *query, gboolean *release_non_mappable);
+
+
 /* context query */
 
 GST_API

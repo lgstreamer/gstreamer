@@ -5153,16 +5153,16 @@ default_element_query (GstElement * element, GstQuery * query)
 }
 
 static void
-gst_base_sink_drain (GstBaseSink * basesink)
+gst_base_sink_drain (GstBaseSink * basesink, gboolean release_non_mappable)
 {
   GstBuffer *old;
   GstBufferList *old_list;
 
   GST_OBJECT_LOCK (basesink);
-  if ((old = basesink->priv->last_buffer))
+  if ((old = basesink->priv->last_buffer) && !release_non_mappable)
     basesink->priv->last_buffer = gst_buffer_copy_deep (old);
 
-  if ((old_list = basesink->priv->last_buffer_list))
+  if ((old_list = basesink->priv->last_buffer_list) && !release_non_mappable)
     basesink->priv->last_buffer_list = gst_buffer_list_copy_deep (old_list);
   GST_OBJECT_UNLOCK (basesink);
 
@@ -5183,7 +5183,7 @@ gst_base_sink_default_query (GstBaseSink * basesink, GstQuery * query)
   switch (GST_QUERY_TYPE (query)) {
     case GST_QUERY_ALLOCATION:
     {
-      gst_base_sink_drain (basesink);
+      gst_base_sink_drain (basesink, FALSE);
       if (bclass->propose_allocation)
         res = bclass->propose_allocation (basesink, query);
       else
@@ -5220,7 +5220,10 @@ gst_base_sink_default_query (GstBaseSink * basesink, GstQuery * query)
     }
     case GST_QUERY_DRAIN:
     {
-      gst_base_sink_drain (basesink);
+      gboolean release_non_mappable;
+
+      gst_query_parse_drain (query, &release_non_mappable);
+      gst_base_sink_drain (basesink, release_non_mappable);
       res = TRUE;
       break;
     }
